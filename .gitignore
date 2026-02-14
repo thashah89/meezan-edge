@@ -1,0 +1,35 @@
+# ── Zerodha tokens (NEVER commit these) ──────────────────────────────────────
+zerodha_token.json
+*.token
+
+# ── Streamlit local secrets (NEVER commit this) ───────────────────────────────
+.streamlit/secrets.toml
+
+# ── Stock data cache (re-fetched automatically) ───────────────────────────────
+halal_stocks_cache.json
+*.cache.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Environment ───────────────────────────────────────────────────────────────
+.env
+.venv
+venv/
+env/
+
+# ── OS files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp

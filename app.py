@@ -75,11 +75,14 @@ try:
     from zerodha_auth import ZerodhaSession
     from config import ZERODHA_API_KEY, ZERODHA_API_SECRET
     if ZERODHA_API_KEY and ZERODHA_API_SECRET:
-        _zs = ZerodhaSession()
-        if _zs.handle_redirect():
-            st.rerun()          # re-render clean (URL query params now gone)
-except Exception:
-    pass   # silently skip if kiteconnect not installed yet
+        _zs_global = ZerodhaSession()
+        if _zs_global.handle_redirect():
+            st.rerun()   # re-render clean after token exchange
+except Exception as _auth_err:
+    # Only warn if there is actually a request_token in the URL
+    # (otherwise silent is fine — no redirect happened)
+    if "request_token" in str(st.query_params):
+        st.error(f"Zerodha token exchange failed: {_auth_err}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -88,8 +91,38 @@ except Exception:
 
 with st.sidebar:
     st.title("🕌 Halal Trading")
-    # Live data source indicator
-    st.caption(active_data_source())
+
+    # ── Zerodha auth banner (every page, every load) ──────────────────────────
+    try:
+        from zerodha_auth import ZerodhaSession
+        from config import ZERODHA_API_KEY, ZERODHA_API_SECRET
+        _sidebar_zs = ZerodhaSession()
+
+        if ZERODHA_API_KEY and ZERODHA_API_SECRET:
+            if _sidebar_zs.is_authenticated():
+                st.success("🟢 Zerodha Live Connected")
+                if st.button("🚪 Logout Zerodha", use_container_width=True,
+                             key="sidebar_logout"):
+                    _sidebar_zs.logout()
+                    st.rerun()
+            else:
+                st.warning("🟡 Zerodha — Login Required")
+                _login_url = _sidebar_zs.login_url()
+                st.markdown(
+                    f"""<a href="{_login_url}" target="_self" style="text-decoration:none">
+  <div style="background:#387ed1;color:white;text-align:center;
+              padding:8px 0;border-radius:6px;font-weight:600;
+              font-size:14px;cursor:pointer;margin-bottom:4px">
+    🔐 Login with Zerodha
+  </div></a>""",
+                    unsafe_allow_html=True,
+                )
+                st.caption("Login every morning to use live Zerodha data.")
+        else:
+            st.caption("🔵 Data: Yahoo Finance")
+    except Exception:
+        st.caption("🔵 Data: Yahoo Finance")
+
     st.markdown("---")
 
     page = st.radio("Navigate", [

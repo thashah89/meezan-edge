@@ -1,29 +1,22 @@
 """
-zerodha_auth.py – Complete Zerodha Kite Connect authentication handler.
+zerodha_auth.py – Zerodha Kite Connect authentication handler.
 
-Covers:
-  1. Login URL builder           → sends user to Zerodha login page
-  2. URL token reader            → reads request_token Zerodha posts back to your app URL
-  3. Session generator           → exchanges request_token → access_token
-  4. Token cache                 → saves token to file so you only login once per day
-  5. Kite instance factory       → returns an authenticated KiteConnect object
-  6. Data fetchers               → historical + live price using Kite API
-  7. Order placer                → place / modify / cancel orders via Kite API
-  8. Postback handler            → parses order-update POST from Zerodha
+Works WITHOUT the kiteconnect SDK — uses raw HTTPS with the correct
+Kite v3 headers that Zerodha requires.
+Installs kiteconnect if present and uses SDK path when available.
 
-Usage in app.py (Streamlit):
-    from zerodha_auth import ZerodhaSession
-    zs = ZerodhaSession()
-    if not zs.is_authenticated():
-        st.markdown(f"[Login with Zerodha]({zs.login_url()})")
-        zs.handle_redirect()   # reads ?request_token= from the current URL
-    else:
-        kite = zs.kite()
+Auth flow:
+  1. login_url()       → build the Zerodha login URL
+  2. User logs in      → Zerodha redirects to your app URL with ?request_token=
+  3. handle_redirect() → reads token from URL, exchanges for access_token
+  4. kite()            → returns authenticated KiteConnect object (if SDK installed)
 """
 
 import json
 import os
+import hashlib
 import logging
+import requests
 from datetime import datetime, date, timedelta
 
 import pandas as pd
@@ -33,14 +26,17 @@ from config import (
     ZERODHA_REDIRECT_URL, ZERODHA_POSTBACK_URL,
     ZERODHA_TOKEN_FILE,
 )
-from market_data import add_indicators
 
 log = logging.getLogger(__name__)
 
+# ── Kite v3 base URL and required headers ─────────────────────────────────────
+_KITE_API_BASE = "https://api.kite.trade"
+_KITE_HEADERS  = {
+    "X-Kite-Version":  "3",                        # ← mandatory for all v3 calls
+    "Content-Type":    "application/x-www-form-urlencoded",
+    "User-Agent":      "Kite Python Raw Client/1.0",
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DEPENDENCY GUARD
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _kite_available() -> bool:
     try:
@@ -51,7 +47,7 @@ def _kite_available() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TOKEN CACHE  (file-based, survives app restarts within the same day)
+#  TOKEN CACHE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _save_token(api_key: str, access_token: str, public_token: str = "") -> None:
@@ -63,15 +59,11 @@ def _save_token(api_key: str, access_token: str, public_token: str = "") -> None
     }
     with open(ZERODHA_TOKEN_FILE, "w") as f:
         json.dump(payload, f, indent=2)
-    log.info(f"Token saved to {ZERODHA_TOKEN_FILE}")
+    log.info(f"Token saved → {ZERODHA_TOKEN_FILE}")
 
 
 def _load_token() -> dict | None:
-    """
-    Load cached token.  Returns None if:
-      • file doesn't exist
-      • token is from a previous day (Zerodha tokens expire at 6 AM next day)
-    """
+    """Load today's cached token. Returns None if missing or from a previous day."""
     if not os.path.exists(ZERODHA_TOKEN_FILE):
         return None
     try:
@@ -89,156 +81,148 @@ def _load_token() -> dict | None:
 def _clear_token() -> None:
     if os.path.exists(ZERODHA_TOKEN_FILE):
         os.remove(ZERODHA_TOKEN_FILE)
-        log.info("Token cache cleared.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ZERODHA SESSION  (main class)
+#  RAW HTTPS SESSION GENERATOR  (no SDK needed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _raw_generate_session(api_key: str,
+                           api_secret: str,
+                           request_token: str) -> dict:
+    """
+    Exchange request_token for access_token using raw HTTPS.
+    Sends the exact headers Zerodha v3 requires.
+
+    Returns the full Zerodha response dict on success.
+    Raises ValueError with Zerodha's error message on failure.
+    """
+    # Checksum = SHA256(api_key + request_token + api_secret)
+    raw         = f"{api_key}{request_token}{api_secret}"
+    checksum    = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    url  = f"{_KITE_API_BASE}/session/token"
+    data = {
+        "api_key":       api_key,
+        "request_token": request_token,
+        "checksum":      checksum,
+    }
+
+    log.info(f"POST {url}  api_key={api_key[:6]}…  token={request_token[:8]}…")
+
+    resp = requests.post(
+        url,
+        data    = data,
+        headers = _KITE_HEADERS,
+        timeout = 15,
+    )
+
+    log.info(f"Zerodha response: HTTP {resp.status_code}")
+
+    try:
+        body = resp.json()
+    except Exception:
+        raise ValueError(f"Non-JSON response from Zerodha (HTTP {resp.status_code}): {resp.text[:300]}")
+
+    if body.get("status") != "success":
+        # Surface Zerodha's exact error message back to the user
+        msg        = body.get("message", "Unknown error")
+        error_type = body.get("error_type", "")
+        raise ValueError(f"Zerodha error [{error_type}]: {msg}")
+
+    return body.get("data", {})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ZERODHA SESSION
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ZerodhaSession:
-    """
-    Manages the full Zerodha Kite Connect auth lifecycle inside a Streamlit app.
-
-    Quick-start:
-        zs = ZerodhaSession()
-
-        # Step 1 — show login button if not authenticated
-        if not zs.is_authenticated():
-            url = zs.login_url()
-            st.markdown(f'<a href="{url}" target="_self">Login with Zerodha</a>',
-                        unsafe_allow_html=True)
-            # Step 2 — after redirect, read token from URL automatically
-            zs.handle_redirect()
-        else:
-            kite = zs.kite()   # ready to use
-    """
 
     def __init__(self):
-        self._kite_obj = None
+        self._kite_obj    = None
         self._access_token: str | None = None
         self._credentials_ok = bool(ZERODHA_API_KEY and ZERODHA_API_SECRET)
 
-        # Try loading a cached token immediately
+        # Load today's cached token if available
         cached = _load_token()
         if cached and cached.get("access_token"):
             self._access_token = cached["access_token"]
             if _kite_available():
                 self._init_kite(self._access_token)
 
-    # ── CREDENTIAL CHECK ───────────────────────────────────────────────────────
-
     def credentials_configured(self) -> bool:
-        """True when API key + secret are filled in config.py."""
         return self._credentials_ok
 
     def is_authenticated(self) -> bool:
-        """True when a valid access_token exists for today."""
         return self._access_token is not None
 
-    # ── STEP 1: BUILD LOGIN URL ────────────────────────────────────────────────
+    # ── BUILD LOGIN URL ────────────────────────────────────────────────────────
 
     def login_url(self) -> str:
         """
-        Returns the Zerodha login URL.
-        User opens this in browser → logs in → Zerodha redirects back to
-        ZERODHA_REDIRECT_URL?request_token=XXXX&status=success
+        Returns the Kite v3 login URL.
+        Format:  https://kite.zerodha.com/connect/login?v=3&api_key={key}
+        After login Zerodha redirects to:
+          {ZERODHA_REDIRECT_URL}?request_token=XXXX&action=login&status=success
         """
         if not self._credentials_ok:
-            raise ValueError(
-                "ZERODHA_API_KEY and ZERODHA_API_SECRET must be set in config.py"
-            )
+            raise ValueError("ZERODHA_API_KEY and ZERODHA_API_SECRET not set in Secrets.")
+
         if _kite_available():
             from kiteconnect import KiteConnect
-            kite = KiteConnect(api_key=ZERODHA_API_KEY)
-            return kite.login_url()
-        else:
-            # Fallback URL without SDK
-            return (
-                f"https://kite.zerodha.com/connect/login"
-                f"?v=3&api_key={ZERODHA_API_KEY}"
-            )
+            return KiteConnect(api_key=ZERODHA_API_KEY).login_url()
 
-    # ── STEP 2: READ request_token FROM REDIRECT URL ───────────────────────────
+        # Manual URL — same as what the SDK builds
+        return (
+            "https://kite.zerodha.com/connect/login"
+            f"?v=3&api_key={ZERODHA_API_KEY}"
+        )
+
+    # ── HANDLE REDIRECT ────────────────────────────────────────────────────────
 
     def handle_redirect(self) -> bool:
         """
-        Call this on every Streamlit page load.
-
-        Streamlit reads the current browser URL query params via
-        st.query_params.  After Zerodha redirects the user back,
-        the URL looks like:
-            http://127.0.0.1:8501?request_token=XXXX&status=success
-
-        This method:
-          • reads the request_token from the URL
-          • exchanges it for an access_token
-          • saves the token to cache
-          • clears the query params from the URL (clean address bar)
-          • returns True on success
-
-        Must be called from inside a Streamlit script (needs st.query_params).
+        Call on every Streamlit page load.
+        Reads ?request_token= from URL, exchanges it, caches access_token.
+        Returns True when a new login was just completed.
         """
         import streamlit as st
 
-        params = st.query_params
+        params        = st.query_params
         request_token = params.get("request_token", None)
         status        = params.get("status", "")
 
         if not request_token:
-            return False   # no redirect happened yet
+            return False   # no redirect happened
 
-        if status != "success":
-            st.error(f"Zerodha login failed. Status: {status}")
+        # Zerodha sends status=success on success
+        if status not in ("success", ""):
+            st.error(f"Zerodha login failed. Status returned: `{status}`")
             st.query_params.clear()
             return False
 
-        # Exchange request_token → access_token
         try:
-            access_token, public_token = self._generate_session(request_token)
+            data         = _raw_generate_session(
+                               ZERODHA_API_KEY, ZERODHA_API_SECRET, request_token)
+            access_token = data["access_token"]
+            public_token = data.get("public_token", "")
+
             self._access_token = access_token
             _save_token(ZERODHA_API_KEY, access_token, public_token)
             self._init_kite(access_token)
 
-            # Clean the URL (remove ?request_token=... from address bar)
             st.query_params.clear()
             log.info("Zerodha authentication successful.")
             return True
 
         except Exception as e:
-            st.error(f"Token exchange failed: {e}")
+            st.error(f"❌ Token exchange failed: {e}")
+            log.error(f"Token exchange error: {e}")
             st.query_params.clear()
             return False
 
-    def _generate_session(self, request_token: str) -> tuple[str, str]:
-        """Exchange request_token for access_token using Kite SDK or raw HTTPS."""
-        if _kite_available():
-            from kiteconnect import KiteConnect
-            import hashlib
-            kite = KiteConnect(api_key=ZERODHA_API_KEY)
-            data = kite.generate_session(request_token,
-                                          api_secret=ZERODHA_API_SECRET)
-            return data["access_token"], data.get("public_token", "")
-        else:
-            # Raw HTTPS fallback (no SDK installed)
-            import requests, hashlib
-            checksum = hashlib.sha256(
-                f"{ZERODHA_API_KEY}{request_token}{ZERODHA_API_SECRET}".encode()
-            ).hexdigest()
-            r = requests.post(
-                "https://api.kite.trade/session/token",
-                data={
-                    "api_key":       ZERODHA_API_KEY,
-                    "request_token": request_token,
-                    "checksum":      checksum,
-                },
-                timeout=15,
-            )
-            r.raise_for_status()
-            d = r.json()["data"]
-            return d["access_token"], d.get("public_token", "")
-
-    # ── KITE OBJECT ────────────────────────────────────────────────────────────
+    # ── KITE OBJECT (SDK path) ─────────────────────────────────────────────────
 
     def _init_kite(self, access_token: str) -> None:
         if _kite_available():
@@ -248,11 +232,16 @@ class ZerodhaSession:
             self._kite_obj = kite
 
     def kite(self):
-        """Return the authenticated KiteConnect object (or None)."""
+        """
+        Returns authenticated KiteConnect object (if SDK installed),
+        otherwise None.  Raw HTTP callers use _raw_kite_get/post instead.
+        """
         return self._kite_obj
 
+    def access_token(self) -> str | None:
+        return self._access_token
+
     def logout(self) -> None:
-        """Clear token and reset session."""
         if self._kite_obj:
             try:
                 self._kite_obj.invalidate_access_token()
@@ -260,37 +249,92 @@ class ZerodhaSession:
                 pass
         _clear_token()
         self._access_token = None
-        self._kite_obj = None
+        self._kite_obj     = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ZERODHA DATA FETCHERS
+#  RAW KITE API CALLS  (used when kiteconnect SDK is not installed)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_historical_zerodha(kite,
+def _raw_get(endpoint: str, access_token: str, params: dict = None) -> dict:
+    """Authenticated GET to Kite v3 API."""
+    headers = {
+        **_KITE_HEADERS,
+        "Authorization": f"token {ZERODHA_API_KEY}:{access_token}",
+    }
+    resp = requests.get(
+        f"{_KITE_API_BASE}{endpoint}",
+        headers = headers,
+        params  = params or {},
+        timeout = 15,
+    )
+    body = resp.json()
+    if body.get("status") != "success":
+        raise ValueError(f"Kite API error: {body.get('message', body)}")
+    return body.get("data", {})
+
+
+def _raw_post(endpoint: str, access_token: str, data: dict = None) -> dict:
+    """Authenticated POST to Kite v3 API."""
+    headers = {
+        **_KITE_HEADERS,
+        "Authorization": f"token {ZERODHA_API_KEY}:{access_token}",
+    }
+    resp = requests.post(
+        f"{_KITE_API_BASE}{endpoint}",
+        headers = headers,
+        data    = data or {},
+        timeout = 15,
+    )
+    body = resp.json()
+    if body.get("status") != "success":
+        raise ValueError(f"Kite API error: {body.get('message', body)}")
+    return body.get("data", {})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATA FETCHERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_historical_zerodha(kite_or_token,
                               instrument_token: int,
                               ticker_label: str,
                               days: int = 400,
                               interval: str = "day") -> pd.DataFrame | None:
     """
-    Fetch OHLCV history from Zerodha and return an indicator-enriched DataFrame.
-
-    Args:
-        kite              – authenticated KiteConnect object
-        instrument_token  – Zerodha instrument token (integer)
-        ticker_label      – display name (e.g. "TCS.NS")
-        days              – how many calendar days of history
-        interval          – "day" / "60minute" / "30minute" / "5minute" / "minute"
+    Fetch OHLCV history from Zerodha.
+    Accepts either a KiteConnect object (SDK) or an access_token string (raw).
     """
+    from market_data import add_indicators
+
+    end   = datetime.now()
+    start = end - timedelta(days=days)
+
     try:
-        end   = datetime.now()
-        start = end - timedelta(days=days)
-        raw   = kite.historical_data(
-            instrument_token=instrument_token,
-            from_date=start,
-            to_date=end,
-            interval=interval,
-        )
+        if _kite_available() and hasattr(kite_or_token, "historical_data"):
+            raw = kite_or_token.historical_data(
+                instrument_token = instrument_token,
+                from_date = start, to_date = end, interval = interval,
+            )
+        else:
+            # Raw HTTP path
+            access_token = kite_or_token if isinstance(kite_or_token, str) else None
+            if not access_token:
+                return None
+            raw = _raw_get(
+                f"/instruments/historical/{instrument_token}/{interval}",
+                access_token,
+                params={
+                    "from": start.strftime("%Y-%m-%d"),
+                    "to":   end.strftime("%Y-%m-%d"),
+                },
+            )
+            raw = raw.get("candles", [])
+            # candles format: [timestamp, open, high, low, close, volume]
+            raw = [{"date": r[0], "open": r[1], "high": r[2],
+                    "low": r[3], "close": r[4], "volume": r[5]}
+                   for r in raw]
+
         if not raw:
             return None
 
@@ -299,43 +343,47 @@ def fetch_historical_zerodha(kite,
                              "low":"Low","close":"Close","volume":"Volume"},
                   inplace=True)
         df.set_index("Date", inplace=True)
-
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
-
         df = df[["Open","High","Low","Close","Volume"]].dropna()
         return add_indicators(df)
 
     except Exception as e:
-        log.warning(f"{ticker_label} Zerodha fetch error: {e}")
+        log.warning(f"{ticker_label} historical fetch error: {e}")
         return None
 
 
-def get_live_quote_zerodha(kite, instrument_tokens: list) -> dict:
+def get_live_quote(kite_or_token, symbols: list[str]) -> dict:
     """
-    Fetch live quotes for a list of instrument tokens.
-    Returns {token: {last_price, ohlc, volume, ...}}
+    Fetch live quotes.  symbols = ["NSE:TCS", "NSE:INFY", …]
+    Returns {symbol: {last_price, ohlc, …}}
     """
     try:
-        return kite.quote(instrument_tokens)
+        if _kite_available() and hasattr(kite_or_token, "quote"):
+            return kite_or_token.quote(symbols)
+        else:
+            data = _raw_get("/quote", kite_or_token,
+                             params={"i": symbols})
+            return data
     except Exception as e:
         log.warning(f"Quote fetch error: {e}")
         return {}
 
 
-def get_instrument_token(kite, exchange: str, tradingsymbol: str) -> int | None:
-    """
-    Look up the Zerodha instrument token for a given symbol.
-    e.g. get_instrument_token(kite, "NSE", "TCS") → 2374401
-    """
+def get_instrument_token(kite_or_token, symbol: str,
+                          exchange: str = "NSE") -> int | None:
     try:
-        instruments = kite.instruments(exchange)
+        if _kite_available() and hasattr(kite_or_token, "instruments"):
+            instruments = kite_or_token.instruments(exchange)
+        else:
+            instruments = _raw_get(f"/instruments/{exchange}", kite_or_token)
+
         for inst in instruments:
-            if inst["tradingsymbol"] == tradingsymbol:
+            if inst.get("tradingsymbol") == symbol:
                 return inst["instrument_token"]
         return None
     except Exception as e:
-        log.warning(f"Instrument lookup failed for {tradingsymbol}: {e}")
+        log.warning(f"Token lookup failed for {symbol}: {e}")
         return None
 
 
@@ -343,7 +391,7 @@ def get_instrument_token(kite, exchange: str, tradingsymbol: str) -> int | None:
 #  ORDER PLACER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def place_order(kite,
+def place_order(kite_or_token,
                 tradingsymbol: str,
                 quantity: int,
                 transaction_type: str = "BUY",
@@ -351,52 +399,55 @@ def place_order(kite,
                 price: float | None   = None,
                 trigger_price: float | None = None,
                 exchange: str         = "NSE",
-                product: str          = "MIS",       # MIS=intraday, CNC=delivery
-                tag: str              = "halal_bot") -> dict:
-    """
-    Place an order via Zerodha Kite.
-
-    Args:
-        tradingsymbol  – NSE symbol, e.g. "TCS"
-        quantity       – number of shares
-        transaction_type – "BUY" or "SELL"
-        order_type     – "MARKET" | "LIMIT" | "SL" | "SL-M"
-        price          – required for LIMIT orders
-        trigger_price  – required for SL / SL-M orders
-        product        – "MIS" (intraday) | "CNC" (delivery / positional)
-        tag            – custom tag visible in Zerodha console
-
-    Returns:
-        {"success": True, "order_id": "...", ...}
-        {"success": False, "error": "..."}
-    """
-    from kiteconnect import KiteConnect
-
+                product: str          = "MIS",
+                tag: str              = "meezan_edge") -> dict:
     try:
-        params = dict(
-            variety          = kite.VARIETY_REGULAR,
-            exchange         = exchange,
-            tradingsymbol    = tradingsymbol,
-            transaction_type = (kite.TRANSACTION_TYPE_BUY
-                                if transaction_type == "BUY"
-                                else kite.TRANSACTION_TYPE_SELL),
-            quantity         = quantity,
-            product          = (kite.PRODUCT_MIS if product == "MIS"
-                                else kite.PRODUCT_CNC),
-            order_type       = {
-                "MARKET": kite.ORDER_TYPE_MARKET,
-                "LIMIT":  kite.ORDER_TYPE_LIMIT,
-                "SL":     kite.ORDER_TYPE_SL,
-                "SL-M":   kite.ORDER_TYPE_SLM,
-            }.get(order_type, kite.ORDER_TYPE_MARKET),
-            tag              = tag,
-        )
-        if price:          params["price"]         = price
-        if trigger_price:  params["trigger_price"] = trigger_price
+        if _kite_available() and hasattr(kite_or_token, "place_order"):
+            kite = kite_or_token
+            params = dict(
+                variety          = kite.VARIETY_REGULAR,
+                exchange         = exchange,
+                tradingsymbol    = tradingsymbol,
+                transaction_type = (kite.TRANSACTION_TYPE_BUY
+                                    if transaction_type == "BUY"
+                                    else kite.TRANSACTION_TYPE_SELL),
+                quantity         = quantity,
+                product          = (kite.PRODUCT_MIS if product == "MIS"
+                                    else kite.PRODUCT_CNC),
+                order_type       = {
+                    "MARKET": kite.ORDER_TYPE_MARKET,
+                    "LIMIT":  kite.ORDER_TYPE_LIMIT,
+                    "SL":     kite.ORDER_TYPE_SL,
+                    "SL-M":   kite.ORDER_TYPE_SLM,
+                }.get(order_type, kite.ORDER_TYPE_MARKET),
+                tag = tag,
+            )
+            if price:         params["price"]         = price
+            if trigger_price: params["trigger_price"] = trigger_price
+            order_id = kite.place_order(**params)
 
-        order_id = kite.place_order(**params)
-        log.info(f"Order placed: {transaction_type} {quantity} {tradingsymbol} "
-                 f"({order_type}) → order_id={order_id}")
+        else:
+            # Raw HTTP path
+            access_token = kite_or_token if isinstance(kite_or_token, str) else None
+            if not access_token:
+                return {"success": False, "error": "No access token"}
+            data = {
+                "variety":          "regular",
+                "exchange":          exchange,
+                "tradingsymbol":     tradingsymbol,
+                "transaction_type":  transaction_type,
+                "quantity":          str(quantity),
+                "product":           product,
+                "order_type":        order_type,
+                "tag":               tag,
+            }
+            if price:         data["price"]         = str(price)
+            if trigger_price: data["trigger_price"] = str(trigger_price)
+
+            result   = _raw_post("/orders/regular", access_token, data)
+            order_id = result.get("order_id", "")
+
+        log.info(f"Order placed: {transaction_type} {quantity} {tradingsymbol} → {order_id}")
         return {"success": True, "order_id": order_id}
 
     except Exception as e:
@@ -404,119 +455,54 @@ def place_order(kite,
         return {"success": False, "error": str(e)}
 
 
-def place_bracket_order_manual(kite,
-                                tradingsymbol: str,
-                                quantity: int,
-                                entry_price: float,
-                                stop_loss: float,
-                                target: float,
-                                exchange: str = "NSE") -> dict:
-    """
-    Simulates a bracket order using 3 separate orders:
-      1. LIMIT BUY at entry_price
-      2. SL-M SELL at stop_loss (stop-loss leg)
-      3. LIMIT SELL at target (profit-booking leg)
-
-    Zerodha's bracket order (BO) can also be used directly if available.
-    """
-    results = {}
-
-    # Entry order
-    entry = place_order(kite, tradingsymbol, quantity,
-                         "BUY", "LIMIT", price=entry_price,
-                         exchange=exchange, product="MIS")
-    results["entry"] = entry
-
-    if not entry["success"]:
-        return {"success": False, "error": "Entry order failed", "details": results}
-
-    # Stop-loss order
-    sl = place_order(kite, tradingsymbol, quantity,
-                      "SELL", "SL-M", trigger_price=stop_loss,
-                      exchange=exchange, product="MIS")
-    results["stop_loss"] = sl
-
-    # Target order
-    tgt = place_order(kite, tradingsymbol, quantity,
-                       "SELL", "LIMIT", price=target,
-                       exchange=exchange, product="MIS")
-    results["target"] = tgt
-
-    results["success"] = all(r["success"] for r in results.values()
-                              if isinstance(r, dict) and "success" in r)
-    return results
-
-
-def get_orders(kite) -> list[dict]:
-    """Return all orders placed today."""
+def get_orders(kite_or_token) -> list:
     try:
-        return kite.orders() or []
+        if _kite_available() and hasattr(kite_or_token, "orders"):
+            return kite_or_token.orders() or []
+        return _raw_get("/orders", kite_or_token) or []
     except Exception as e:
         log.warning(f"get_orders error: {e}")
         return []
 
 
-def get_positions(kite) -> dict:
-    """Return current open positions."""
+def get_positions(kite_or_token) -> dict:
     try:
-        return kite.positions() or {}
+        if _kite_available() and hasattr(kite_or_token, "positions"):
+            return kite_or_token.positions() or {}
+        return _raw_get("/portfolio/positions", kite_or_token) or {}
     except Exception as e:
         log.warning(f"get_positions error: {e}")
         return {}
 
 
-def get_holdings(kite) -> list[dict]:
-    """Return delivery holdings."""
+def get_holdings(kite_or_token) -> list:
     try:
-        return kite.holdings() or []
+        if _kite_available() and hasattr(kite_or_token, "holdings"):
+            return kite_or_token.holdings() or []
+        return _raw_get("/portfolio/holdings", kite_or_token) or []
     except Exception as e:
         log.warning(f"get_holdings error: {e}")
         return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  POSTBACK HANDLER  (Zerodha → your server → here)
+#  POSTBACK PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_postback(raw_post_data: dict) -> dict:
-    """
-    Parse an order-update postback sent by Zerodha to your postback URL.
-
-    Zerodha sends a POST request with these fields:
-        order_id, exchange_order_id, status, tradingsymbol,
-        exchange, transaction_type, quantity, price, filled_quantity,
-        average_price, order_timestamp, ...
-
-    Call this from your postback endpoint:
-        data = parse_postback(request.form)   # Flask
-        data = parse_postback(await request.json())  # FastAPI
-
-    Returns a clean dict with the key fields + a human-readable message.
-    """
     status = raw_post_data.get("status", "").upper()
     symbol = raw_post_data.get("tradingsymbol", "")
     txn    = raw_post_data.get("transaction_type", "")
     qty    = raw_post_data.get("filled_quantity", 0)
     avg    = raw_post_data.get("average_price", 0)
     oid    = raw_post_data.get("order_id", "")
-
-    emoji  = {"COMPLETE": "✅", "REJECTED": "❌",
-               "CANCELLED": "⚠️"}.get(status, "🔄")
-
-    msg = (f"{emoji} Order {oid} | {txn} {qty} {symbol} "
-           f"@ ₹{avg} | Status: {status}")
-
+    emoji  = {"COMPLETE":"✅","REJECTED":"❌","CANCELLED":"⚠️"}.get(status,"🔄")
+    msg    = f"{emoji} Order {oid} | {txn} {qty} {symbol} @ ₹{avg} | {status}"
     log.info(f"Postback: {msg}")
-
     return {
-        "order_id":        oid,
-        "status":          status,
-        "tradingsymbol":   symbol,
-        "transaction_type":txn,
-        "filled_quantity": qty,
-        "average_price":   avg,
-        "message":         msg,
-        "raw":             raw_post_data,
+        "order_id": oid, "status": status, "tradingsymbol": symbol,
+        "transaction_type": txn, "filled_quantity": qty,
+        "average_price": avg, "message": msg, "raw": raw_post_data,
     }
 
 
@@ -525,20 +511,8 @@ def parse_postback(raw_post_data: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_login_ui(zs: "ZerodhaSession") -> bool:
-    """
-    Renders the Zerodha login panel inside a Streamlit app.
-    Returns True if the user is (now) authenticated.
-
-    Call from any Streamlit page:
-        from zerodha_auth import ZerodhaSession, render_login_ui
-        zs = ZerodhaSession()
-        if render_login_ui(zs):
-            kite = zs.kite()
-            # do live trading stuff
-    """
     import streamlit as st
 
-    # Always try to pick up a redirect first
     just_logged_in = zs.handle_redirect()
     if just_logged_in:
         st.success("✅ Zerodha login successful!")
@@ -548,35 +522,17 @@ def render_login_ui(zs: "ZerodhaSession") -> bool:
         return True
 
     if not zs.credentials_configured():
-        st.error(
-            "Zerodha credentials not configured. "
-            "Open `config.py` and fill in `ZERODHA_API_KEY` and `ZERODHA_API_SECRET`."
-        )
+        st.error("API Key/Secret not set. Add them in Streamlit Secrets.")
         return False
 
-    # Show login button
-    st.markdown("### 🔐 Zerodha Login Required")
-    st.markdown(
-        "Click the button below to log in with your Zerodha account. "
-        "You will be redirected back here automatically after login."
-    )
-
     login_url = zs.login_url()
+    st.markdown("### 🔐 Login to Zerodha")
     st.markdown(
-        f"""
-<a href="{login_url}" target="_self">
-  <button style="
-    background:#387ed1;color:white;border:none;
-    padding:12px 28px;border-radius:6px;
-    font-size:16px;cursor:pointer;font-weight:600">
-    🔐 Login with Zerodha
-  </button>
-</a>
-""",
+        f"""<a href="{login_url}" target="_self">
+<button style="background:#387ed1;color:white;border:none;
+  padding:12px 28px;border-radius:6px;font-size:16px;
+  cursor:pointer;font-weight:600">🔐 Login with Zerodha</button></a>""",
         unsafe_allow_html=True,
     )
-
-    st.caption(
-        f"After login, Zerodha will redirect you back to: `{ZERODHA_REDIRECT_URL}`"
-    )
+    st.caption(f"Redirect URL: `{ZERODHA_REDIRECT_URL}`")
     return False

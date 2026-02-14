@@ -70,7 +70,7 @@ ZERODHA_POSTBACK_URL = _get_secret("ZERODHA_POSTBACK_URL", "")
 ZERODHA_TOKEN_FILE   = "zerodha_token.json"
 
 # ── DATA SOURCE ───────────────────────────────────────────────────────────────
-DATA_SOURCE         = "yfinance"  # "yfinance" (free)  |  "zerodha" (live)
+DATA_SOURCE         = "zerodha"  # "yfinance" (free)  |  "zerodha" (live)
 SCRAPER_URL         = "https://halalstock.in/halal-shariah-compliant-shares-list/"
 CACHE_FILE          = "halal_stocks_cache.json"
 

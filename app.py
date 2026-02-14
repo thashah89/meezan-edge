@@ -23,7 +23,7 @@ from config import (TOTAL_CAPITAL, CAPITAL_PER_TRADE, BACKTEST_WEEKS,
                     CACHE_FILE, PATTERN_WINDOW_DAYS,
                     PRICE_MIN, PRICE_MAX)
 from scraper       import scrape_halal_stocks
-from market_data   import fetch_all, company_info
+from market_data   import fetch_all, company_info, active_data_source
 from trend_filter  import filter_uptrend_stocks, build_summary_table, classify_trend
 from pattern_engine import find_similar_patterns, pattern_summary
 from backtester    import backtest_ticker, best_strategy, summary_table, expected_value_table
@@ -88,6 +88,8 @@ except Exception:
 
 with st.sidebar:
     st.title("🕌 Halal Trading")
+    # Live data source indicator
+    st.caption(active_data_source())
     st.markdown("---")
 
     page = st.radio("Navigate", [

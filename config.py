@@ -19,12 +19,12 @@ def _get_secret(key: str, fallback: str = "") -> str:
 
 # ── CAPITAL SETTINGS ─────────────────────────────────────────────────────────
 TOTAL_CAPITAL      = 100_000   # ₹ Total trading capital
-CAPITAL_PER_TRADE  = 25_000    # ₹ Fixed amount invested per trade
+CAPITAL_PER_TRADE  = 75_000    # ₹ Fixed amount invested per trade
 RISK_PCT_PER_TRADE = 2.0       # % of total capital risked per trade (stop-loss sizing)
-MAX_POSITIONS      = 4         # Max simultaneous open trades
+MAX_POSITIONS      = 10         # Max simultaneous open trades
 
 # ── BACKTEST SETTINGS ─────────────────────────────────────────────────────────
-BACKTEST_WEEKS     = 4         # How many recent weeks to backtest (1-12)
+BACKTEST_WEEKS     = 12         # How many recent weeks to backtest (1-12)
 LOOKBACK_DAYS      = 365       # Extra historical days fetched for indicators & patterns
 MAX_HOLD_DAYS      = 10        # Auto-exit after N days if target/stop not hit
 
@@ -32,8 +32,8 @@ MAX_HOLD_DAYS      = 10        # Auto-exit after N days if target/stop not hit
 # Only stocks whose current price falls inside [PRICE_MIN, PRICE_MAX] will be
 # downloaded, analysed, and backtested.  Set PRICE_MAX = 0 to disable the cap.
 # Applied BEFORE full history download → dramatically speeds up Refresh Data.
-PRICE_MIN          = 100       # ₹ Minimum stock price  (e.g. 100)
-PRICE_MAX          = 5_000     # ₹ Maximum stock price  (0 = no upper limit)
+PRICE_MIN          = 600       # ₹ Minimum stock price  (e.g. 100)
+PRICE_MAX          = 2_500     # ₹ Maximum stock price  (0 = no upper limit)
 
 # ── TREND FILTER THRESHOLDS ───────────────────────────────────────────────────
 TREND_ADX_MIN      = 20        # Minimum ADX for "trending" market

@@ -24,11 +24,18 @@ from config import (TOTAL_CAPITAL, CAPITAL_PER_TRADE, BACKTEST_WEEKS,
                     PRICE_MIN, PRICE_MAX)
 from scraper       import scrape_halal_stocks
 from market_data   import fetch_all, company_info, active_data_source
-from trend_filter  import filter_uptrend_stocks, build_summary_table, classify_trend
 from pattern_engine import find_similar_patterns, pattern_summary
 from backtester    import backtest_ticker, best_strategy, summary_table, expected_value_table
 from live_engine   import (generate_live_signals, calc_levels_2to1,
                             monitor_open_positions, fetch_live_daily)
+from data_cache    import (save_cache, load_cache, cache_status,
+                            export_cache_bytes, import_cache_bytes)
+from trend_filter  import (filter_uptrend_stocks, build_summary_table,
+                            classify_trend, get_strategy_stocks, STRATEGY_LABELS,
+                            STRATEGY_DESCRIPTIONS)
+
+APP_VERSION = "v1.5.0"
+APP_RELEASE = "2026-02-15"  
 
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
@@ -63,6 +70,15 @@ def _init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # Auto-load persistent cache on first load of this session
+    if not st.session_state.get("_cache_loaded"):
+        cached = load_cache()
+        if cached and cached.get("trend_list"):
+            st.session_state["trend_list"]   = cached["trend_list"]
+            st.session_state["halal_stocks"] = cached.get("halal_stocks", [])
+            st.session_state["data_loaded"]  = True
+        st.session_state["_cache_loaded"] = True
 
 _init_state()
 S = st.session_state
@@ -133,6 +149,7 @@ with st.sidebar:
     page = st.radio("Navigate", [
         "🏠 Overview",
         "📋 Stock Universe",
+        "🎯 Strategy Filter",
         "📈 Trend Analysis",
         "🔬 Backtest Results",
         "🔍 Pattern Analysis",
@@ -209,10 +226,13 @@ with st.sidebar:
             S.trend_list = filter_uptrend_stocks(S.market_data)
         S.backtest_results = {}
         S.data_loaded = True
+        # Persist to cache so data survives browser tab close / redeploy
+        save_cache(S.market_data, S.trend_list, S.halal_stocks)
         st.success(
             f"✅ Loaded **{downloaded_count[0]}** stocks  |  "
             f"⏭ Skipped **{skipped_count[0]}** (outside ₹{S.price_min:,}"
-            f"{'–₹'+str(f'{S.price_max:,}') if S.price_max > 0 else '+'} range)"
+            f"{'–₹'+str(f'{S.price_max:,}') if S.price_max > 0 else '+'} range)  |  "
+            f"💾 Saved to cache"
         )
         st.rerun()
 
@@ -234,12 +254,43 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
+    # ── Cache age banner ─────────────────────────────────────────────────────
+    _cache_payload = load_cache()
+    _cstatus = cache_status(_cache_payload)
+    if _cstatus["level"] == "none":
+        st.info("📭 No data — click **Refresh Data** to load stocks")
+    elif _cstatus["level"] == "expired":
+        st.error(_cstatus["message"])
+    elif _cstatus["level"] == "warn":
+        st.warning(_cstatus["message"])
+    else:
+        st.success(_cstatus["message"])
+
     if S.data_loaded:
         up = sum(1 for t in S.trend_list if t["is_uptrend"])
         st.metric("Halal Stocks",   len(S.halal_stocks))
-        st.metric("Data Loaded",    len(S.market_data))
-        st.metric("In Uptrend",     up)
+        st.metric("Uptrend",        up)
         st.metric("Backtested",     len(S.backtest_results))
+
+    # ── Cache export / import ────────────────────────────────────────────────
+    with st.expander("💾 Save / Restore Data"):
+        cache_bytes = export_cache_bytes()
+        if cache_bytes:
+            st.download_button("⬇ Download cache", data=cache_bytes,
+                file_name="meezan_cache.json", mime="application/json",
+                use_container_width=True,
+                help="Save this file — upload it after a redeployment to restore data instantly")
+        uploaded = st.file_uploader("⬆ Upload saved cache", type=["json"],
+                                     label_visibility="collapsed")
+        if uploaded:
+            if import_cache_bytes(uploaded.read()):
+                st.success("✅ Cache restored!")
+                st.rerun()
+            else:
+                st.error("Invalid cache file.")
+
+    # ── Version badge ────────────────────────────────────────────────────────
+    st.caption(f"Meezan Edge {APP_VERSION} · {APP_RELEASE}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -396,6 +447,117 @@ elif page == "📋 Stock Universe":
         st.dataframe(df_all[mask].reset_index(drop=True),
                      use_container_width=True, hide_index=True)
         st.caption(f"Showing {mask.sum()} of {len(df_all)} Halal stocks")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: STRATEGY FILTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🎯 Strategy Filter":
+    st.title("🎯 Strategy Filter")
+    st.markdown("Find stocks best suited to each trading style based on their current indicator profile.")
+
+    if not S.trend_list:
+        _no_data_warning()
+    else:
+        # ── Strategy selector ─────────────────────────────────────────────────
+        from trend_filter import STRATEGY_DESCRIPTIONS
+        strategy_cols = st.columns(5)
+        strategy_choice = strategy_cols[0].radio(
+            "Strategy",
+            options=["all", "swing", "momentum", "breakout", "mean_revert"],
+            format_func=lambda x: {
+                "all": "📊 All",
+                "swing": "🔄 Swing",
+                "momentum": "🚀 Momentum",
+                "breakout": "💥 Breakout",
+                "mean_revert": "↩️ Mean Revert",
+            }[x],
+            label_visibility="collapsed",
+            horizontal=True,
+        )
+
+        if strategy_choice != "all":
+            desc = STRATEGY_DESCRIPTIONS.get(strategy_choice, "")
+            st.info(f"**{strategy_choice.replace('_',' ').title()}:** {desc}")
+
+        filtered = get_strategy_stocks(S.trend_list, strategy_choice)
+
+        # ── Additional filters ────────────────────────────────────────────────
+        fa, fb, fc = st.columns(3)
+        min_score  = fa.slider("Min Trend Score", 0, 9, 3)
+        min_adx    = fb.slider("Min ADX", 0, 50, 0)
+        uptrend_only = fc.checkbox("Uptrend only", value=False)
+
+        filtered = [t for t in filtered if t.get("trend_score",0) >= min_score]
+        filtered = [t for t in filtered if (t.get("adx") or 0) >= min_adx]
+        if uptrend_only:
+            filtered = [t for t in filtered if t.get("is_uptrend")]
+
+        if not filtered:
+            st.warning("No stocks match this strategy filter. Try relaxing the criteria.")
+        else:
+            # ── Summary metrics row ───────────────────────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Matching Stocks", len(filtered))
+            m2.metric("Strong Uptrend", sum(1 for t in filtered if t.get("trend_level",0) >= 5))
+            m3.metric("Avg RSI", f"{sum(t.get('rsi',50) or 50 for t in filtered)/len(filtered):.0f}")
+            m4.metric("Avg ADX", f"{sum(t.get('adx',0) or 0 for t in filtered)/len(filtered):.0f}")
+
+            # ── Table with strategy scores ─────────────────────────────────────
+            rows = []
+            for t in filtered:
+                sc = t.get("strategy_scores", {})
+                rows.append({
+                    "Ticker":        t["ticker"],
+                    "Best For":      t.get("strategy_label","—"),
+                    "Swing ▲":       sc.get("swing",0),
+                    "Momentum ▲":    sc.get("momentum",0),
+                    "Breakout ▲":    sc.get("breakout",0),
+                    "Mean Rev ▲":    sc.get("mean_revert",0),
+                    "Trend":         t["trend_label"],
+                    "Score":         t["trend_score"],
+                    "Price (₹)":     t["current_price"],
+                    "RSI":           t.get("rsi"),
+                    "ADX":           t.get("adx"),
+                    "Vol Ratio":     t.get("vol_ratio"),
+                    "vs SMA20 %":    t.get("pct_from_sma20"),
+                    "20D Ret %":     t.get("change_20d_pct"),
+                })
+
+            df_strat = pd.DataFrame(rows)
+
+            # Colour the score columns
+            def _colour_score(val):
+                if not isinstance(val, (int, float)): return ""
+                if val >= 70: return "background-color: #004d26; color: #00ff88"
+                if val >= 50: return "background-color: #1a3300; color: #88cc44"
+                if val >= 35: return "background-color: #2a2200; color: #ccaa00"
+                return ""
+
+            score_cols = ["Swing ▲", "Momentum ▲", "Breakout ▲", "Mean Rev ▲"]
+            styled = df_strat.style.applymap(_colour_score, subset=score_cols)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.caption(f"Showing {len(filtered)} stocks. Scores 0-100. Green ≥70, Amber ≥50.")
+
+            # ── Top pick per strategy ──────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("🏆 Top Pick Per Strategy")
+            pick_cols = st.columns(4)
+            for i, strat in enumerate(["swing","momentum","breakout","mean_revert"]):
+                top = get_strategy_stocks(S.trend_list, strat)
+                if top:
+                    t = top[0]
+                    sc = t.get("strategy_scores",{}).get(strat,0)
+                    pick_cols[i].metric(
+                        label=STRATEGY_LABELS[strat],
+                        value=t["ticker"],
+                        delta=f"Score {sc}/100",
+                    )
+                    pick_cols[i].caption(
+                        f"₹{t['current_price']} | RSI {t.get('rsi','—')} | ADX {t.get('adx','—')}"
+                    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1128,9 +1290,37 @@ Expected reward: <b>{sig['reward_pct_of_capital']:.2f}%</b> of capital if T2 hit
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif page == "⚙️ Settings":
-    st.title("⚙️ Settings & Capital Configuration")
+    st.title("⚙️ Settings")
 
-    st.markdown("### 💰 Capital Management Explained")
+    _stab1, _stab2, _stab3 = st.tabs(["⚙️ Configuration", "📋 Changelog", "📊 Cache Info"])
+
+    with _stab3:
+        st.subheader("📊 Data Cache Status")
+        _cp = load_cache()
+        _cs = cache_status(_cp)
+        if _cp:
+            st.json({
+                "saved_at":     _cp.get("saved_at","—"),
+                "ticker_count": _cp.get("ticker_count", len(_cp.get("market_summary",{}))),
+                "status":       _cs["level"],
+                "age_days":     round(_cs["age_days"],1) if _cs["age_days"] else "—",
+            })
+        else:
+            st.info("No cache loaded yet. Refresh Data to create one.")
+
+    with _stab2:
+        st.subheader("📋 Changelog")
+        try:
+            with open("CHANGELOG.md") as _clf:
+                st.markdown(_clf.read())
+        except FileNotFoundError:
+            st.info("CHANGELOG.md not found in app directory.")
+
+    with _stab1:
+        pass  # configuration content continues below
+    if True:  # keep indentation — config tab content below
+        st.markdown("### 💰 Capital Management Explained")  
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("""

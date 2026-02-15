@@ -68,23 +68,25 @@ _init_state()
 S = st.session_state
 
 # ── Zerodha redirect handler (runs on EVERY page load) ───────────────────────
-# After Zerodha login, the browser is sent back to this app with
-# ?request_token=XXXX in the URL.  We must catch it here — before any page
-# renders — so the token is exchanged and cached immediately.
+# After Zerodha login, Zerodha sends the browser to this app with
+# ?request_token=XXXX in the URL. handle_redirect() reads it, exchanges it
+# for an access_token, and stores in st.session_state.
+#
+# ⚠️  We do NOT call st.query_params.clear() here.
+#     On Streamlit Cloud, clear() issues a real HTTP 302 redirect.
+#     Calling it on every page load that has ?request_token= causes an
+#     infinite redirect loop → browser shows "too many redirects".
+#     Instead, handle_redirect() uses a session_state flag to ensure the
+#     token is only exchanged once. The URL params are left alone and
+#     disappear naturally when the user navigates or refreshes manually.
 try:
     from zerodha_auth import ZerodhaSession
     from config import ZERODHA_API_KEY, ZERODHA_API_SECRET
     if ZERODHA_API_KEY and ZERODHA_API_SECRET:
         _zs_global = ZerodhaSession()
-        _redirect_result = _zs_global.handle_redirect()
-        if _redirect_result:
-            # Clear the request_token from the URL exactly ONCE.
-            # st.query_params.clear() already triggers a Streamlit rerun on
-            # Streamlit Cloud — do NOT also call st.rerun() or the browser
-            # sees two back-to-back HTTP redirects → "too many redirects".
-            st.query_params.clear()
+        _zs_global.handle_redirect()   # no rerun, no query_params.clear()
 except Exception as _auth_err:
-    if "request_token" in str(st.query_params):
+    if st.query_params.get("request_token"):
         st.error(f"Zerodha token exchange failed: {_auth_err}")
 
 

@@ -43,6 +43,7 @@ _KITE_HEADERS  = {
 _SS_TOKEN        = "zerodha_access_token"
 _SS_PUBLIC_TOKEN = "zerodha_public_token"
 _SS_LOGIN_DATE   = "zerodha_login_date"
+_SS_PROCESSED    = "zerodha_processed_token"  # prevents re-processing same request_token
 
 
 def _kite_available() -> bool:
@@ -237,19 +238,21 @@ class ZerodhaSession:
 
     def handle_redirect(self) -> bool:
         """
-        Call on every Streamlit page load.
+        Call once on every Streamlit page load (top of app.py only).
 
-        Reads ?request_token= from the URL, exchanges it for an access_token,
-        and stores in st.session_state.
+        Reads ?request_token= from st.query_params, exchanges it for an
+        access_token, and stores it in st.session_state.
 
-        Returns:
-          "fresh"  – token was just exchanged right now (new login)
-          "already" – token already existed in session_state (no action needed)
-          False    – no request_token in URL (normal page load)
+        Returns True if a fresh token was just exchanged, False otherwise.
 
-        IMPORTANT: This method intentionally does NOT call
-        st.query_params.clear() or st.rerun(). The caller must do exactly
-        ONE of those — doing both causes a redirect loop on Streamlit Cloud.
+        ── CRITICAL: NO st.query_params.clear(), NO st.rerun() ──────────────
+        On Streamlit Cloud, st.query_params.clear() issues a real HTTP 302
+        redirect. If called in a loop (every page load while params exist)
+        the browser sees infinite redirects → "too many redirects" error.
+
+        Instead we use a session_state flag (_SS_PROCESSED) to remember that
+        this request_token has already been handled. The URL params are left
+        alone — they do no harm and disappear naturally when the user navigates.
         """
         import streamlit as st
 
@@ -258,16 +261,22 @@ class ZerodhaSession:
         status        = params.get("status", "").strip()
 
         if not request_token:
-            return False    # normal page load — nothing to do
+            return False    # normal page load — no token in URL
 
-        # Status check (some Zerodha configs send status, some don't)
-        if status and status != "success":
-            st.error(f"Zerodha returned status=`{status}`. Login failed.")
+        # Already processed this token in this session — skip silently
+        if st.session_state.get(_SS_PROCESSED) == request_token:
             return False
 
-        # Token already in session_state — just a stale URL, no action needed
+        # Status check
+        if status and status != "success":
+            st.error(f"Zerodha returned status=`{status}`. Try logging in again.")
+            st.session_state[_SS_PROCESSED] = request_token  # don't retry
+            return False
+
+        # Already authenticated today — mark as processed and skip exchange
         if _ss_load():
-            return "already"
+            st.session_state[_SS_PROCESSED] = request_token
+            return False
 
         # Exchange request_token → access_token
         try:
@@ -276,18 +285,20 @@ class ZerodhaSession:
             access_token = data["access_token"]
             public_token = data.get("public_token", "")
 
-            _ss_save(access_token, public_token)   # PRIMARY — survives reruns
-            _file_save(access_token, public_token) # SECONDARY — local dev only
+            _ss_save(access_token, public_token)              # session_state (primary)
+            _file_save(access_token, public_token)            # file (local dev only)
+            st.session_state[_SS_PROCESSED] = request_token  # mark done — no retry
 
             self._access_token = access_token
             self._init_kite(access_token)
 
             log.info("✅ Zerodha authentication successful")
-            return "fresh"
+            return True
 
         except Exception as e:
             st.error(f"❌ Zerodha token exchange failed: {e}")
             log.error(f"Token exchange error: {e}")
+            st.session_state[_SS_PROCESSED] = request_token  # don't retry bad token
             return False
 
     # ── KITE OBJECT ───────────────────────────────────────────────────────────

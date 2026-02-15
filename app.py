@@ -76,11 +76,14 @@ try:
     from config import ZERODHA_API_KEY, ZERODHA_API_SECRET
     if ZERODHA_API_KEY and ZERODHA_API_SECRET:
         _zs_global = ZerodhaSession()
-        if _zs_global.handle_redirect():
-            st.rerun()   # re-render clean after token exchange
+        _redirect_result = _zs_global.handle_redirect()
+        if _redirect_result:
+            # Clear the request_token from the URL exactly ONCE.
+            # st.query_params.clear() already triggers a Streamlit rerun on
+            # Streamlit Cloud — do NOT also call st.rerun() or the browser
+            # sees two back-to-back HTTP redirects → "too many redirects".
+            st.query_params.clear()
 except Exception as _auth_err:
-    # Only warn if there is actually a request_token in the URL
-    # (otherwise silent is fine — no redirect happened)
     if "request_token" in str(st.query_params):
         st.error(f"Zerodha token exchange failed: {_auth_err}")
 
@@ -109,15 +112,15 @@ with st.sidebar:
                 st.warning("🟡 Zerodha — Login Required")
                 _login_url = _sidebar_zs.login_url()
                 st.markdown(
-                    f"""<a href="{_login_url}" target="_self" style="text-decoration:none">
+                    f"""<a href="{_login_url}" target="_blank" style="text-decoration:none">
   <div style="background:#387ed1;color:white;text-align:center;
               padding:8px 0;border-radius:6px;font-weight:600;
               font-size:14px;cursor:pointer;margin-bottom:4px">
-    🔐 Login with Zerodha
+    🔐 Login with Zerodha ↗
   </div></a>""",
                     unsafe_allow_html=True,
                 )
-                st.caption("Login every morning to use live Zerodha data.")
+                st.caption("Opens Zerodha in a new tab. After authorizing, come back here — the app will detect the login automatically.")
         else:
             st.caption("🔵 Data: Yahoo Finance")
     except Exception:
@@ -1209,10 +1212,9 @@ All risk calculations are based on this.
         # ── Auth panel ────────────────────────────────────────────────────────
         zs = ZerodhaSession()
 
-        # Always handle redirect first (reads ?request_token= from URL)
-        if zs.handle_redirect():
-            st.success("✅ Zerodha login successful! Token cached for today.")
-            st.rerun()
+        # handle_redirect() is already called by the global handler at the
+        # top of app.py on every page load — no need to call it again here.
+        # Just check the current auth state.
 
         if zs.is_authenticated():
             st.success("🟢 **Authenticated** — access token is valid for today.")
@@ -1284,25 +1286,91 @@ All risk calculations are based on this.
                         st.info("No open positions.")
 
         else:
-            # ── Login button ──────────────────────────────────────────────────
+            # ── Login button (opens new tab) ───────────────────────────────────
             st.markdown("#### 🔐 Login to Zerodha")
-            st.info(
-                "After clicking Login, you will be taken to Zerodha's login page. "
-                "Once you log in, Zerodha redirects you back here automatically "
-                f"with a token in the URL (`{ZERODHA_REDIRECT_URL}?request_token=...`)."
-                "  The app reads it, exchanges it, and you're authenticated."
-            )
+
             login_url = zs.login_url()
+
+            # ── DEBUG PANEL ───────────────────────────────────────────────────
+            with st.expander("🔍 Debug Info — check this if login fails", expanded=True):
+                st.markdown("**Step 1 — Verify these URLs match your Zerodha developer portal EXACTLY:**")
+                da, db = st.columns(2)
+                da.markdown("**Registered in Kite portal**")
+                db.markdown("**Used by this app**")
+                da.code("Redirect URL:\n" + ZERODHA_REDIRECT_URL)
+                db.code("From Secrets:\n" + ZERODHA_REDIRECT_URL)
+                st.warning(
+                    "⚠️ Even a single character difference (trailing slash, http vs https) "
+                    "causes the `Missing or empty field authorize` error. "
+                    "Go to [developers.kite.trade](https://developers.kite.trade) and confirm "
+                    "the redirect URL is **exactly**: `" + ZERODHA_REDIRECT_URL + "`"
+                )
+                st.markdown("**Step 2 — Full login URL being sent to Zerodha:**")
+                st.code(login_url)
+                st.markdown("**Step 3 — What this page receives from Zerodha after login:**")
+                raw_params = dict(st.query_params)
+                if raw_params:
+                    st.json(raw_params)
+                    if "request_token" in raw_params:
+                        st.success(f"✅ request_token received: `{raw_params['request_token'][:12]}…`")
+                    if raw_params.get("status") == "error":
+                        st.error("Zerodha returned status=error — check redirect URL match above.")
+                else:
+                    st.info("No URL params yet — shown here after you authorize on Zerodha.")
+
+            st.markdown("---")
             st.markdown(
-                f"""<a href="{login_url}" target="_self">
-  <button style="background:#387ed1;color:white;border:none;
-    padding:12px 32px;border-radius:6px;font-size:16px;
-    cursor:pointer;font-weight:600;width:100%">
-    🔐 Login with Zerodha
-  </button></a>""",
+                "**How to login:**\n\n"
+                "1️⃣ Click the button below — Zerodha opens in a **new tab**  \n"
+                "2️⃣ Log in with your Zerodha credentials + 2FA  \n"
+                "3️⃣ Click **Authorize** on the permissions screen  \n"
+                "4️⃣ Zerodha redirects back to this app in the same new tab  \n"
+                "5️⃣ Come back to this tab — sidebar will show 🟢 Connected"
+            )
+
+            st.markdown(
+                f'''<a href="{login_url}" target="_blank" style="text-decoration:none">
+  <div style="background:#387ed1;color:white;text-align:center;
+    padding:14px;border-radius:8px;font-weight:700;font-size:17px;
+    cursor:pointer;margin:8px 0">
+    🔐 Login with Zerodha &nbsp;↗&nbsp; (opens new tab)
+  </div></a>''',
                 unsafe_allow_html=True,
             )
-            st.caption(f"Redirect URL: `{ZERODHA_REDIRECT_URL}`")
+            st.caption(f"Redirect URL registered in Zerodha portal: `{ZERODHA_REDIRECT_URL}`")
+
+            # ── MANUAL FALLBACK ───────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### 🔧 Manual Fallback — if automatic redirect doesn't work")
+            st.caption(
+                "After authorizing on Zerodha, if you land on a JSON error page, "
+                "copy the `request_token` value from that page's URL bar and paste it here."
+            )
+            with st.form("manual_token_form"):
+                manual_token = st.text_input(
+                    "Paste request_token here",
+                    placeholder="e.g. HDq7rDYTTjRl9Y4JbxiEaA==",
+                    help="Found in the URL bar after Zerodha redirects: ?request_token=XXXX"
+                )
+                submitted_manual = st.form_submit_button("🔓 Authenticate with this token")
+
+            if submitted_manual and manual_token.strip():
+                from zerodha_auth import _raw_generate_session, _save_token
+                try:
+                    data = _raw_generate_session(
+                        ZERODHA_API_KEY, ZERODHA_API_SECRET,
+                        manual_token.strip()
+                    )
+                    access_token = data["access_token"]
+                    public_token = data.get("public_token","")
+                    zs._access_token = access_token
+                    _save_token(ZERODHA_API_KEY, access_token, public_token)
+                    zs._init_kite(access_token)
+                    st.success("✅ Authenticated successfully via manual token!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Token exchange failed: {e}")
+                    st.info("Make sure you paste the full request_token from the URL, not the whole URL.")
 
     # ── How to install kiteconnect ─────────────────────────────────────────────
     st.markdown("---")

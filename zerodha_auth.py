@@ -239,11 +239,17 @@ class ZerodhaSession:
         """
         Call on every Streamlit page load.
 
-        After Zerodha login, the browser URL contains:
-          ?request_token=XXXX&status=success&action=login&type=login
+        Reads ?request_token= from the URL, exchanges it for an access_token,
+        and stores in st.session_state.
 
-        This method reads the token, exchanges it, stores in session_state.
-        Returns True if a fresh login was just completed.
+        Returns:
+          "fresh"  – token was just exchanged right now (new login)
+          "already" – token already existed in session_state (no action needed)
+          False    – no request_token in URL (normal page load)
+
+        IMPORTANT: This method intentionally does NOT call
+        st.query_params.clear() or st.rerun(). The caller must do exactly
+        ONE of those — doing both causes a redirect loop on Streamlit Cloud.
         """
         import streamlit as st
 
@@ -252,41 +258,36 @@ class ZerodhaSession:
         status        = params.get("status", "").strip()
 
         if not request_token:
-            return False    # no redirect in this URL
+            return False    # normal page load — nothing to do
 
-        # Accept status=success or blank (some Zerodha configs omit it)
+        # Status check (some Zerodha configs send status, some don't)
         if status and status != "success":
             st.error(f"Zerodha returned status=`{status}`. Login failed.")
-            st.query_params.clear()
             return False
 
-        # Don't re-exchange if we already have a token for today
+        # Token already in session_state — just a stale URL, no action needed
         if _ss_load():
-            st.query_params.clear()
-            return False
+            return "already"
 
+        # Exchange request_token → access_token
         try:
             data         = _raw_generate_session(
                                ZERODHA_API_KEY, ZERODHA_API_SECRET, request_token)
             access_token = data["access_token"]
             public_token = data.get("public_token", "")
 
-            # PRIMARY: session_state
-            _ss_save(access_token, public_token)
-            # SECONDARY: file (local only, silent on cloud)
-            _file_save(access_token, public_token)
+            _ss_save(access_token, public_token)   # PRIMARY — survives reruns
+            _file_save(access_token, public_token) # SECONDARY — local dev only
 
             self._access_token = access_token
             self._init_kite(access_token)
 
-            st.query_params.clear()
             log.info("✅ Zerodha authentication successful")
-            return True
+            return "fresh"
 
         except Exception as e:
             st.error(f"❌ Zerodha token exchange failed: {e}")
             log.error(f"Token exchange error: {e}")
-            # Don't clear query_params — keep for debug
             return False
 
     # ── KITE OBJECT ───────────────────────────────────────────────────────────
@@ -475,10 +476,11 @@ def parse_postback(raw: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_login_ui(zs: ZerodhaSession) -> bool:
+    """
+    Renders auth state. Call AFTER the global handle_redirect() at top of app.
+    Does NOT call handle_redirect() here — that would cause a double-redirect.
+    """
     import streamlit as st
-    if zs.handle_redirect():
-        st.success("✅ Zerodha login successful!")
-        st.rerun()
     if zs.is_authenticated():
         return True
     if not zs.credentials_configured():

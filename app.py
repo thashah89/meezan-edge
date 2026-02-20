@@ -288,7 +288,7 @@ if "Market Intelligence" in view:
     active_stocks = get_active_stocks()
     symbols = [s["symbol"] for s in active_stocks]
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
         if st.button("📥 Load Stocks", use_container_width=True):
@@ -330,31 +330,19 @@ if "Market Intelligence" in view:
                     try:
                         z_client = get_zerodha_client()
                         result = z_client.refresh_latest_metrics(symbols)
-                        st.success(f"Updated metrics for {result.inserted_or_updated} symbols.")
+                        sectors_updated, sectors_missing = z_client.refresh_sector_buckets(symbols)
+                        st.success(
+                            f"Updated metrics for {result.inserted_or_updated} symbols "
+                            f"and sectors for {sectors_updated} symbols."
+                        )
                         if result.failed:
                             st.warning(f"Failed for {result.failed} symbols.")
+                        if sectors_missing:
+                            st.info(f"Could not resolve sector for {sectors_missing} symbols.")
                     except ZerodhaConfigError as exc:
                         st.error(str(exc))
                     except Exception as exc:
                         st.error(f"Metrics refresh failed: {exc}")
-
-    with col3:
-        if st.button("🏷️ Refresh Sectors", use_container_width=True):
-            if not symbols:
-                st.warning("Load stock universe first before refreshing sectors.")
-            else:
-                with st.spinner("Refreshing sector buckets from Zerodha instruments..."):
-                    try:
-                        z_client = get_zerodha_client()
-                        updated, missing = z_client.refresh_sector_buckets(symbols)
-                        st.success(f"Updated sectors for {updated} stocks.")
-                        if missing:
-                            st.info(f"Could not resolve sector for {missing} stocks.")
-                        st.rerun()
-                    except ZerodhaConfigError as exc:
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.error(f"Sector refresh failed: {exc}")
 
     if active_stocks:
         st.success(f"📊 {len(active_stocks)} stocks loaded")
@@ -370,11 +358,21 @@ if "Market Intelligence" in view:
         else:
             st.info(f"✅ Stock universe valid for {days_left} more days")
         
-        # Show stocks table directly
+        # Show stocks + metrics table directly
         st.markdown("#### 📋 Stocks")
-        df = pd.DataFrame(active_stocks)
-        df = df[[c for c in df.columns if c not in ("load_date", "valid_till")]]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        stocks_df = pd.DataFrame(active_stocks)
+        stocks_df = stocks_df[[c for c in stocks_df.columns if c not in ("load_date", "valid_till")]]
+
+        latest_metrics = get_latest_metrics()
+        metrics_df = pd.DataFrame(latest_metrics) if latest_metrics else pd.DataFrame()
+
+        if not metrics_df.empty:
+            merged_df = stocks_df.merge(metrics_df, on="symbol", how="left", suffixes=("", "_metric"))
+            merged_df = merged_df.sort_values(by="symbol").reset_index(drop=True)
+        else:
+            merged_df = stocks_df.sort_values(by="symbol").reset_index(drop=True)
+
+        st.dataframe(merged_df, use_container_width=True, hide_index=True)
     
     else:
         st.info("No data loaded")

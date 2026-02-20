@@ -180,6 +180,64 @@ class ZerodhaClient:
 
         return RefreshResult(inserted_or_updated=updated, failed=failed, failures=failures)
 
+    def refresh_sector_buckets(self, symbols: List[str]) -> Tuple[int, int]:
+        """
+        Refresh sector buckets for loaded symbols using Zerodha instruments.
+        Returns (updated_count, missing_count).
+        """
+        if not self.is_authenticated:
+            raise ZerodhaConfigError("Zerodha access token is missing. Authenticate first.")
+        if not symbols:
+            return (0, 0)
+
+        instruments = self.kite.instruments("NSE")
+        name_by_symbol: Dict[str, str] = {}
+        for row in instruments:
+            tradingsymbol = str(row.get("tradingsymbol", "")).strip().upper()
+            name = str(row.get("name", "")).strip()
+            if tradingsymbol:
+                name_by_symbol[tradingsymbol] = name
+
+        conn = get_connection()
+        cur = conn.cursor()
+        updated = 0
+        missing = 0
+
+        try:
+            for symbol in symbols:
+                sym = symbol.strip().upper()
+                name = name_by_symbol.get(sym, "")
+
+                if not name:
+                    cur.execute("SELECT company FROM stocks_master WHERE symbol = ?", (sym,))
+                    row = cur.fetchone()
+                    name = (row["company"] if row and row["company"] else "") if row else ""
+
+                if not name:
+                    missing += 1
+                    continue
+
+                bucket = self.classify_sector_bucket(name=name, symbol=sym)
+                cur.execute(
+                    """
+                    UPDATE stocks_master
+                    SET sector = ?, company = COALESCE(NULLIF(company, ''), ?)
+                    WHERE symbol = ?
+                    """,
+                    (bucket, name, sym),
+                )
+                if cur.rowcount > 0:
+                    updated += 1
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return (updated, missing)
+
     @staticmethod
     def _quote_to_metrics_row(symbol: str, quote: Dict) -> Dict[str, float | int | str]:
         """
@@ -253,3 +311,44 @@ class ZerodhaClient:
             "strategy_fit": strategy_fit,
             "confidence": confidence,
         }
+
+    @staticmethod
+    def classify_sector_bucket(name: str, symbol: str = "") -> str:
+        """
+        Map stock to broad sector buckets (intentionally coarse-grained).
+        """
+        text = f"{name} {symbol}".upper()
+
+        keyword_map = {
+            "Financials": [
+                "BANK", "FINANCE", "CAPITAL", "INSURANCE", "NBFC", "HDFC", "ICICI", "SBI"
+            ],
+            "Technology": [
+                "TECH", "INFOTECH", "SOFTWARE", "SYSTEM", "DIGITAL", "IT"
+            ],
+            "Energy": [
+                "OIL", "GAS", "PETRO", "ENERGY", "POWER", "COAL", "ONGC", "RENEW"
+            ],
+            "Healthcare": [
+                "PHARMA", "LAB", "HEALTH", "MEDIC", "HOSP", "BIO", "LIFE SCI"
+            ],
+            "Consumer": [
+                "FMCG", "CONSUMER", "RETAIL", "FOOD", "BEVERAGE", "TEXTILE", "APPAREL", "MART"
+            ],
+            "Industrials": [
+                "CEMENT", "STEEL", "METAL", "MINING", "CHEM", "PAINT", "INFRA",
+                "ENGINEER", "INDUSTR", "MFG", "CONSTRUCT", "LOGISTIC", "PORT"
+            ],
+            "Telecom/Media": [
+                "TELECOM", "COMMUNICATION", "MEDIA", "BROADCAST"
+            ],
+            "Auto/Mobility": [
+                "AUTO", "MOTOR", "TYRE", "BATTERY", "MOBILITY", "TRACTOR"
+            ],
+        }
+
+        for sector, keywords in keyword_map.items():
+            if any(k in text for k in keywords):
+                return sector
+
+        return "Other"

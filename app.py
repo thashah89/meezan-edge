@@ -288,7 +288,7 @@ if "Market Intelligence" in view:
     active_stocks = get_active_stocks()
     symbols = [s["symbol"] for s in active_stocks]
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         if st.button("📥 Load Stocks", use_container_width=True):
@@ -337,6 +337,24 @@ if "Market Intelligence" in view:
                         st.error(str(exc))
                     except Exception as exc:
                         st.error(f"Metrics refresh failed: {exc}")
+
+    with col3:
+        if st.button("🏷️ Refresh Sectors", use_container_width=True):
+            if not symbols:
+                st.warning("Load stock universe first before refreshing sectors.")
+            else:
+                with st.spinner("Refreshing sector buckets from Zerodha instruments..."):
+                    try:
+                        z_client = get_zerodha_client()
+                        updated, missing = z_client.refresh_sector_buckets(symbols)
+                        st.success(f"Updated sectors for {updated} stocks.")
+                        if missing:
+                            st.info(f"Could not resolve sector for {missing} stocks.")
+                        st.rerun()
+                    except ZerodhaConfigError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"Sector refresh failed: {exc}")
 
     if active_stocks:
         st.success(f"📊 {len(active_stocks)} stocks loaded")

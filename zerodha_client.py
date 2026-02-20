@@ -87,7 +87,8 @@ class ZerodhaClient:
             return {}
 
         out: Dict[str, Dict] = {}
-        unique_symbols = [s for s in dict.fromkeys(symbols) if s]
+        normalized = [self.normalize_symbol(s) for s in symbols]
+        unique_symbols = [s for s in dict.fromkeys(normalized) if s]
 
         for i in range(0, len(unique_symbols), batch_size):
             batch = unique_symbols[i : i + batch_size]
@@ -113,7 +114,13 @@ class ZerodhaClient:
         failures: List[Tuple[str, str]] = []
 
         try:
-            for symbol in symbols:
+            for raw_symbol in symbols:
+                symbol = self.normalize_symbol(raw_symbol)
+                if not symbol:
+                    failed += 1
+                    failures.append((str(raw_symbol), "Invalid symbol"))
+                    continue
+
                 q = quotes.get(symbol)
                 if not q:
                     failed += 1
@@ -205,7 +212,10 @@ class ZerodhaClient:
 
         try:
             for symbol in symbols:
-                sym = symbol.strip().upper()
+                sym = self.normalize_symbol(symbol)
+                if not sym:
+                    missing += 1
+                    continue
                 name = name_by_symbol.get(sym, "")
 
                 if not name:
@@ -237,6 +247,23 @@ class ZerodhaClient:
             conn.close()
 
         return (updated, missing)
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        """
+        Normalize symbols to Zerodha NSE tradingsymbol format.
+        Examples:
+        - NSE:INFY -> INFY
+        - INFY.NS -> INFY
+        """
+        s = (symbol or "").strip().upper()
+        if not s:
+            return ""
+        if ":" in s:
+            s = s.split(":", 1)[1]
+        if s.endswith(".NS"):
+            s = s[:-3]
+        return s
 
     @staticmethod
     def _quote_to_metrics_row(symbol: str, quote: Dict) -> Dict[str, float | int | str]:

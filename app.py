@@ -203,6 +203,9 @@ with st.sidebar:
         st.session_state.total_capital = config.DEFAULT_CAPITAL
     
     st.metric("Total Capital", f"₹{st.session_state.total_capital:,.0f}")
+
+    if "metrics_updated_count" not in st.session_state:
+        st.session_state.metrics_updated_count = 0
     
     # Performance
     try:
@@ -235,19 +238,21 @@ with st.sidebar:
     # Universe validity indicator
     try:
         sidebar_active_stocks = get_active_stocks()
+        st.metric("Loaded Stocks", len(sidebar_active_stocks))
+        st.metric("Metrics Updated", int(st.session_state.metrics_updated_count))
         if sidebar_active_stocks:
             earliest_valid = min(s['valid_till'] for s in sidebar_active_stocks)
             days_left = (datetime.strptime(earliest_valid, "%Y-%m-%d").date() - date.today()).days
             if days_left <= 0:
-                st.error("Universe expired")
+                st.error("Stock list expired")
             elif days_left <= 5:
-                st.warning(f"Universe expires in {days_left} days")
+                st.warning(f"Stock list expires in {days_left} days")
             else:
-                st.info(f"Universe valid for {days_left} days")
+                st.info(f"Stock list valid for {days_left} days")
         else:
-            st.caption("Universe not loaded")
+            st.caption("Stock list not loaded")
     except Exception:
-        st.caption("Universe validity unavailable")
+        st.caption("Stock list validity unavailable")
     
     st.markdown("---")
     
@@ -303,12 +308,21 @@ if "Market Intelligence" in view:
                 valid_till = load_date + timedelta(days=config.STOCK_UNIVERSE_VALID_DAYS)
                 
                 for stock in stocks:
+                    symbol = str(stock.get('symbol', '')).strip().upper()
+                    if ":" in symbol:
+                        symbol = symbol.split(":", 1)[1]
+                    if symbol.endswith(".NS"):
+                        symbol = symbol[:-3]
+
+                    if not symbol:
+                        continue
+
                     cursor.execute("""
                         INSERT OR REPLACE INTO stocks_master
                         (symbol, company, sector, load_date, valid_till)
                         VALUES (?, ?, ?, ?, ?)
                     """, (
-                        stock['symbol'],
+                        symbol,
                         stock['company'],
                         stock.get('sector', 'Unknown'),
                         load_date,
@@ -331,6 +345,7 @@ if "Market Intelligence" in view:
                         z_client = get_zerodha_client()
                         result = z_client.refresh_latest_metrics(symbols)
                         sectors_updated, sectors_missing = z_client.refresh_sector_buckets(symbols)
+                        st.session_state.metrics_updated_count = int(result.inserted_or_updated)
                         st.success(
                             f"Updated metrics for {result.inserted_or_updated} symbols "
                             f"and sectors for {sectors_updated} symbols."
@@ -345,8 +360,6 @@ if "Market Intelligence" in view:
                         st.error(f"Metrics refresh failed: {exc}")
 
     if active_stocks:
-        st.success(f"📊 {len(active_stocks)} stocks loaded")
-        
         # Check validity
         earliest_valid = min(s['valid_till'] for s in active_stocks)
         days_left = (datetime.strptime(earliest_valid, "%Y-%m-%d").date() - date.today()).days
@@ -368,11 +381,16 @@ if "Market Intelligence" in view:
 
         if not metrics_df.empty:
             merged_df = stocks_df.merge(metrics_df, on="symbol", how="left", suffixes=("", "_metric"))
+            if "ltp" in merged_df.columns:
+                merged_df = merged_df[merged_df["ltp"].notna()]
             merged_df = merged_df.sort_values(by="symbol").reset_index(drop=True)
         else:
-            merged_df = stocks_df.sort_values(by="symbol").reset_index(drop=True)
+            merged_df = pd.DataFrame()
 
-        st.dataframe(merged_df, use_container_width=True, hide_index=True)
+        if merged_df.empty:
+            st.info("No successful metric rows to display yet. Click Refresh Metrics.")
+        else:
+            st.dataframe(merged_df, use_container_width=True, hide_index=True)
     
     else:
         st.info("No data loaded")

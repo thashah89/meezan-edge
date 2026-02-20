@@ -4,7 +4,7 @@ Zerodha-ready + backward compatible (keeps 'symbol')
 """
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound
 import json, os, time, logging
 from datetime import datetime
 
@@ -74,7 +74,11 @@ def scrape_halal_stocks(force_refresh: bool = False) -> list[dict]:
 
         return []
 
-    soup = BeautifulSoup(r.text, "lxml")
+    # Streamlit Cloud may not always have lxml installed.
+    try:
+        soup = BeautifulSoup(r.text, "lxml")
+    except FeatureNotFound:
+        soup = BeautifulSoup(r.text, "html.parser")
     tbody = soup.select_one("tbody.row-striping") or soup.find("tbody")
 
     if not tbody:

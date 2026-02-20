@@ -5,9 +5,10 @@ Zerodha (Kite) client wrapper for data-only operations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 import logging
+import pandas as pd
 
 try:
     from kiteconnect import KiteConnect
@@ -15,6 +16,7 @@ except ImportError:  # pragma: no cover
     KiteConnect = None
 
 from database_schema import get_connection
+from utils_indicators import add_indicators
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +108,16 @@ class ZerodhaClient:
         """
         quotes = self.fetch_quotes(symbols)
         today = date.today().isoformat()
+        instrument_token_by_symbol: Dict[str, int] = {}
+        try:
+            instruments = self.kite.instruments("NSE")
+            for row in instruments:
+                tradingsymbol = self.normalize_symbol(str(row.get("tradingsymbol", "")))
+                token = row.get("instrument_token")
+                if tradingsymbol and token:
+                    instrument_token_by_symbol[tradingsymbol] = int(token)
+        except Exception as exc:
+            log.warning("Could not preload instruments for indicator enrichment: %s", exc)
 
         conn = get_connection()
         cur = conn.cursor()
@@ -129,12 +141,17 @@ class ZerodhaClient:
 
                 try:
                     row = self._quote_to_metrics_row(symbol, q)
+                    token = instrument_token_by_symbol.get(symbol)
+                    if token:
+                        row = self._enrich_row_with_history(token, row)
                     cur.execute(
                         """
                         INSERT OR REPLACE INTO stock_metrics
                         (
                             symbol, date, ltp, open, high, low, close, volume,
-                            rsi, adx, macd, macd_signal, atr, bb_width, trend_score,
+                            rsi, adx, macd, macd_signal,
+                            sma_20, sma_50, sma_200, ema_9, ema_21,
+                            atr, bb_upper, bb_middle, bb_lower, bb_width, trend_score,
                             momentum_score, volatility_score, liquidity_score,
                             volume_ratio, win_probability, expected_return,
                             strategy_fit, confidence, updated_at
@@ -142,7 +159,9 @@ class ZerodhaClient:
                         VALUES
                         (
                             ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?,
                             ?, ?, ?, ?, CURRENT_TIMESTAMP
                         )
@@ -160,7 +179,15 @@ class ZerodhaClient:
                             row["adx"],
                             row["macd"],
                             row["macd_signal"],
+                            row["sma_20"],
+                            row["sma_50"],
+                            row["sma_200"],
+                            row["ema_9"],
+                            row["ema_21"],
                             row["atr"],
+                            row["bb_upper"],
+                            row["bb_middle"],
+                            row["bb_lower"],
                             row["bb_width"],
                             row["trend_score"],
                             row["momentum_score"],
@@ -225,9 +252,9 @@ class ZerodhaClient:
 
                 if not name:
                     missing += 1
-                    continue
-
-                bucket = self.classify_sector_bucket(name=name, symbol=sym)
+                    bucket = "Other"
+                else:
+                    bucket = self.classify_sector_bucket(name=name, symbol=sym)
                 cur.execute(
                     """
                     UPDATE stocks_master
@@ -297,7 +324,15 @@ class ZerodhaClient:
         macd = day_change_pct / 2.0
         macd_signal = macd * 0.7
         atr = max(0.01, high - low)
-        bb_width = intraday_range_pct / 100.0
+        bb_middle = prev_close if prev_close > 0 else ltp
+        bb_upper = bb_middle + (2 * atr)
+        bb_lower = max(0.01, bb_middle - (2 * atr))
+        bb_width = ((bb_upper - bb_lower) / bb_middle) * 100 if bb_middle else 0.0
+        sma_20 = prev_close
+        sma_50 = prev_close
+        sma_200 = prev_close
+        ema_9 = prev_close
+        ema_21 = prev_close
         volume_ratio = 1.2 if volume > 0 else 1.0
         win_probability = max(0.45, min(0.75, 0.55 + (day_change_pct / 30.0)))
         expected_return = round(day_change_pct, 3)
@@ -326,7 +361,15 @@ class ZerodhaClient:
             "adx": adx,
             "macd": macd,
             "macd_signal": macd_signal,
+            "sma_20": sma_20,
+            "sma_50": sma_50,
+            "sma_200": sma_200,
+            "ema_9": ema_9,
+            "ema_21": ema_21,
             "atr": atr,
+            "bb_upper": bb_upper,
+            "bb_middle": bb_middle,
+            "bb_lower": bb_lower,
             "bb_width": bb_width,
             "trend_score": trend_score,
             "momentum_score": momentum_score,
@@ -338,6 +381,61 @@ class ZerodhaClient:
             "strategy_fit": strategy_fit,
             "confidence": confidence,
         }
+
+    def _enrich_row_with_history(self, instrument_token: int, row: Dict) -> Dict:
+        """
+        Enrich indicator fields using historical day candles.
+        Falls back to quote-derived defaults if unavailable.
+        """
+        try:
+            to_date = date.today()
+            from_date = to_date - timedelta(days=380)
+            candles = self.kite.historical_data(
+                instrument_token=instrument_token,
+                from_date=from_date,
+                to_date=to_date,
+                interval="day",
+            )
+            if not candles:
+                return row
+
+            df = pd.DataFrame(candles)
+            if df.empty:
+                return row
+
+            required = {"open", "high", "low", "close", "volume"}
+            if not required.issubset(set(df.columns)):
+                return row
+
+            ind_df = add_indicators(df)
+            if ind_df.empty:
+                return row
+
+            last = ind_df.iloc[-1]
+
+            def sfloat(key: str, fallback: float) -> float:
+                val = last.get(key, fallback)
+                return fallback if pd.isna(val) else float(val)
+
+            row["rsi"] = sfloat("RSI", row["rsi"])
+            row["adx"] = sfloat("ADX", row["adx"])
+            row["macd"] = sfloat("MACD", row["macd"])
+            row["macd_signal"] = sfloat("MACD_Signal", row["macd_signal"])
+            row["sma_20"] = sfloat("SMA_20", row["sma_20"])
+            row["sma_50"] = sfloat("SMA_50", row["sma_50"])
+            row["sma_200"] = sfloat("SMA_200", row["sma_200"])
+            row["ema_9"] = sfloat("EMA_9", row["ema_9"])
+            row["ema_21"] = sfloat("EMA_21", row["ema_21"])
+            row["atr"] = sfloat("ATR", row["atr"])
+            row["bb_upper"] = sfloat("BB_Upper", row["bb_upper"])
+            row["bb_middle"] = row["sma_20"]
+            row["bb_lower"] = sfloat("BB_Lower", row["bb_lower"])
+            row["bb_width"] = sfloat("BB_Width", row["bb_width"])
+            row["volume_ratio"] = sfloat("Volume_Ratio", row["volume_ratio"])
+            return row
+        except Exception as exc:
+            log.debug("Indicator enrichment failed for token %s: %s", instrument_token, exc)
+            return row
 
     @staticmethod
     def classify_sector_bucket(name: str, symbol: str = "") -> str:

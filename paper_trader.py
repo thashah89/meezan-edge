@@ -273,25 +273,30 @@ class PaperTradingEngine:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # Backward-compatible query for legacy schemas.
-        cursor.execute("PRAGMA table_info(trades_simulated)")
-        cols = {row["name"] for row in cursor.fetchall()}
+        try:
+            # Backward-compatible query for legacy schemas.
+            cursor.execute("PRAGMA table_info(trades_simulated)")
+            cols = {row["name"] for row in cursor.fetchall()}
+            if not cols:
+                conn.close()
+                return []
 
-        where_clause = "WHERE status = 'open'" if "status" in cols else ""
-        order_parts = []
-        if "entry_date" in cols:
-            order_parts.append("entry_date DESC")
-        if "entry_time" in cols:
-            order_parts.append("entry_time DESC")
+            where_clause = "WHERE status = 'open'" if "status" in cols else ""
+            order_parts = []
+            if "entry_date" in cols:
+                order_parts.append("entry_date DESC")
+            if "entry_time" in cols:
+                order_parts.append("entry_time DESC")
 
-        order_clause = f"ORDER BY {', '.join(order_parts)}" if order_parts else ""
-        sql = f"SELECT * FROM trades_simulated {where_clause} {order_clause}"
-        cursor.execute(sql)
-
-        trades = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-
-        return trades
+            order_clause = f"ORDER BY {', '.join(order_parts)}" if order_parts else ""
+            sql = f"SELECT * FROM trades_simulated {where_clause} {order_clause}"
+            cursor.execute(sql)
+            trades = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return trades
+        except sqlite3.OperationalError:
+            conn.close()
+            return []
     
     def get_position_summary(self) -> Dict:
         """

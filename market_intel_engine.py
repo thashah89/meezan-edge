@@ -314,21 +314,28 @@ def determine_strategy_fit(metrics: Dict) -> str:
     volume_ratio = metrics.get('volume_ratio', 1.0)
     trend_score = metrics.get('trend_score', 0)
     
+    # bb_width may be represented as ratio (0.02) or percent (2.0).
+    bb_width_norm = (bb_width / 100.0) if bb_width > 1 else bb_width
+    
     # Momentum: Strong trend + RSI 55-70 + ADX 30+
-    if trend_score >= 70 and 55 <= rsi <= 70 and adx >= 30:
+    if trend_score >= 65 and 52 <= rsi <= 72 and adx >= 22:
         return 'momentum'
     
     # Breakout: Squeeze + volume surge + ADX rising
-    if bb_width < 0.02 and volume_ratio >= 1.3 and 20 <= adx <= 35:
+    if bb_width_norm < 0.02 and volume_ratio >= 1.2 and 18 <= adx <= 38:
         return 'breakout'
     
     # Swing: Uptrend + pullback + moderate ADX
-    if trend_score >= 60 and 40 <= rsi <= 60 and 20 <= adx <= 40:
+    if trend_score >= 55 and 38 <= rsi <= 62 and 16 <= adx <= 42:
         return 'swing'
     
     # Mean Reversion: Oversold + low ADX
     if rsi <= 35 and adx < 20:
         return 'mean_revert'
+    
+    # Fallback to avoid excessive "none" for otherwise tradable setups.
+    if trend_score >= 50:
+        return 'swing'
     
     return 'none'
 

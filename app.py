@@ -204,9 +204,6 @@ with st.sidebar:
     
     st.metric("Total Capital", f"₹{st.session_state.total_capital:,.0f}")
 
-    if "metrics_updated_count" not in st.session_state:
-        st.session_state.metrics_updated_count = 0
-    
     # Performance
     try:
         conn = get_connection()
@@ -239,7 +236,26 @@ with st.sidebar:
     try:
         sidebar_active_stocks = get_active_stocks()
         st.metric("Loaded Stocks", len(sidebar_active_stocks))
-        st.metric("Metrics Updated", int(st.session_state.metrics_updated_count))
+        metrics_updated_today = 0
+        if sidebar_active_stocks:
+            sidebar_symbols = [s["symbol"] for s in sidebar_active_stocks if s.get("symbol")]
+            if sidebar_symbols:
+                conn = get_connection()
+                cursor = conn.cursor()
+                placeholders = ",".join(["?"] * len(sidebar_symbols))
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) as cnt
+                    FROM stock_metrics
+                    WHERE date = ?
+                    AND symbol IN ({placeholders})
+                    """,
+                    (date.today().isoformat(), *sidebar_symbols)
+                )
+                row = cursor.fetchone()
+                conn.close()
+                metrics_updated_today = int(row[0]) if row else 0
+        st.metric("Metrics Updated", metrics_updated_today)
         if sidebar_active_stocks:
             earliest_valid = min(s['valid_till'] for s in sidebar_active_stocks)
             days_left = (datetime.strptime(earliest_valid, "%Y-%m-%d").date() - date.today()).days
@@ -287,8 +303,8 @@ if "Market Intelligence" in view:
     st.markdown("**Autonomous market analysis and opportunity discovery**")
     st.markdown("---")
     
-    # ── Section A: Stock Universe Control ────────────────────────────────────
-    st.subheader("🗂️ Stock Universe Control")
+    # ── Section A: Stock Management Control ──────────────────────────────────
+    st.subheader("🗂️ Stock Management Control")
     
     active_stocks = get_active_stocks()
     symbols = [s["symbol"] for s in active_stocks]
@@ -354,33 +370,14 @@ if "Market Intelligence" in view:
                     result = z_client.refresh_latest_metrics(symbols, progress_cb=_on_progress)
                     progress_bar.progress(1.0, text="Refreshing sector buckets...")
 
-                    sectors_updated, sectors_missing = z_client.refresh_sector_buckets(symbols)
-                    st.session_state.metrics_updated_count = int(result.inserted_or_updated)
-                    st.success(
-                        f"Updated metrics for {result.inserted_or_updated} symbols "
-                        f"and sectors for {sectors_updated} symbols."
-                    )
-                    if result.failed:
-                        st.warning(f"Failed for {result.failed} symbols.")
-                    if sectors_missing:
-                        st.info(f"Could not resolve sector for {sectors_missing} symbols.")
+                    z_client.refresh_sector_buckets(symbols)
+                    st.rerun()
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
                 except Exception as exc:
                     st.error(f"Metrics refresh failed: {exc}")
 
     if active_stocks:
-        # Check validity
-        earliest_valid = min(s['valid_till'] for s in active_stocks)
-        days_left = (datetime.strptime(earliest_valid, "%Y-%m-%d").date() - date.today()).days
-        
-        if days_left <= 0:
-            st.error(f"⚠️ Stock universe expired! Click 'Load Stocks' to refresh.")
-        elif days_left <= 5:
-            st.warning(f"⚠️ Stock universe expires in {days_left} days")
-        else:
-            st.info(f"✅ Stock universe valid for {days_left} more days")
-        
         # Show stocks + metrics table directly
         st.markdown("#### 📋 Stocks")
         stocks_df = pd.DataFrame(active_stocks)
@@ -390,6 +387,8 @@ if "Market Intelligence" in view:
         metrics_df = pd.DataFrame(latest_metrics) if latest_metrics else pd.DataFrame()
 
         if not metrics_df.empty:
+            if "date" in metrics_df.columns:
+                metrics_df = metrics_df[metrics_df["date"] == date.today().isoformat()]
             merged_df = stocks_df.merge(metrics_df, on="symbol", how="left", suffixes=("", "_metric"))
             if "ltp" in merged_df.columns:
                 merged_df = merged_df[merged_df["ltp"].notna()]

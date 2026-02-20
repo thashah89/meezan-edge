@@ -1,35 +1,76 @@
-# ── Zerodha tokens (NEVER commit these) ──────────────────────────────────────
-zerodha_token.json
-*.token
-
-# ── Streamlit local secrets (NEVER commit this) ───────────────────────────────
-.streamlit/secrets.toml
-
-# ── Stock data cache (re-fetched automatically) ───────────────────────────────
-halal_stocks_cache.json
-*.cache.json
-
-# ── Python ────────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
+*$py.class
+*.so
 .Python
-*.egg-info/
-dist/
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# ── Environment ───────────────────────────────────────────────────────────────
-.env
-.venv
+# Virtual Environment
 venv/
 env/
+ENV/
+meezan_env/
 
-# ── OS files ──────────────────────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# ── IDE ───────────────────────────────────────────────────────────────────────
+# IDEs
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
+
+# Database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.streamlit/secrets.toml
+*.key
+*.pem
+zerodha_token.json
+
+# Cache
+halal_cache.json
+halal_stocks_cache.json
+*.cache
+
+# ML Models
+models/*.joblib
+models/*.pkl
+models/*.h5
+
+# Temporary
+*.tmp
+temp/
+tmp/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Reports
+report.txt
+*.csv

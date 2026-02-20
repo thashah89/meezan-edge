@@ -173,13 +173,6 @@ with st.sidebar:
         sidebar_z_client = get_zerodha_client()
         if sidebar_z_client.is_authenticated:
             st.success("Connected")
-            if st.button("🔌 Test API", use_container_width=True, key="sidebar_test_api"):
-                try:
-                    profile = sidebar_z_client.test_connection()
-                    username = profile.get("user_name") or profile.get("user_id") or "Connected"
-                    st.success(f"Authenticated as {username}")
-                except Exception as exc:
-                    st.error(f"API test failed: {exc}")
         else:
             st.link_button("🔐 Connect Zerodha", sidebar_z_client.get_login_url(), use_container_width=True)
             st.caption("After login, return here to complete auth.")
@@ -238,6 +231,23 @@ with st.sidebar:
         
     except:
         pass
+
+    # Universe validity indicator
+    try:
+        sidebar_active_stocks = get_active_stocks()
+        if sidebar_active_stocks:
+            earliest_valid = min(s['valid_till'] for s in sidebar_active_stocks)
+            days_left = (datetime.strptime(earliest_valid, "%Y-%m-%d").date() - date.today()).days
+            if days_left <= 0:
+                st.error("Universe expired")
+            elif days_left <= 5:
+                st.warning(f"Universe expires in {days_left} days")
+            else:
+                st.info(f"Universe valid for {days_left} days")
+        else:
+            st.caption("Universe not loaded")
+    except Exception:
+        st.caption("Universe validity unavailable")
     
     st.markdown("---")
     
@@ -281,7 +291,7 @@ if "Market Intelligence" in view:
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("📥 Load Halal Universe", use_container_width=True):
+        if st.button("📥 Load Stocks", use_container_width=True):
             with st.spinner("Loading halal stocks..."):
                 stocks = scrape_halal_stocks()
                 
@@ -308,7 +318,7 @@ if "Market Intelligence" in view:
                 conn.commit()
                 conn.close()
                 
-                st.success(f"✅ Loaded {len(stocks)} halal stocks")
+                st.success(f"✅ Loaded {len(stocks)} stocks")
                 st.rerun()
     
     with col2:
@@ -336,19 +346,20 @@ if "Market Intelligence" in view:
         days_left = (datetime.strptime(earliest_valid, "%Y-%m-%d").date() - date.today()).days
         
         if days_left <= 0:
-            st.error(f"⚠️ Stock universe expired! Click 'Load Halal Universe' to refresh.")
+            st.error(f"⚠️ Stock universe expired! Click 'Load Stocks' to refresh.")
         elif days_left <= 5:
             st.warning(f"⚠️ Stock universe expires in {days_left} days")
         else:
             st.info(f"✅ Stock universe valid for {days_left} more days")
         
-        # Show stocks table
-        with st.expander("📋 View Stocks", expanded=False):
-            df = pd.DataFrame(active_stocks)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+        # Show stocks table directly
+        st.markdown("#### 📋 Stocks")
+        df = pd.DataFrame(active_stocks)
+        df = df[[c for c in df.columns if c not in ("load_date", "valid_till")]]
+        st.dataframe(df, use_container_width=True, hide_index=True)
     
     else:
-        st.warning("No stocks loaded. Click 'Load Halal Universe' to begin.")
+        st.info("No data loaded")
     
     st.markdown("---")
     

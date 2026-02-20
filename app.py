@@ -78,14 +78,71 @@ def get_zerodha_client() -> ZerodhaClient:
         raise ZerodhaConfigError("Missing [zerodha] section in .streamlit/secrets.toml")
 
     session_token = st.session_state.get("zerodha_access_token", "")
+    persisted_token = _load_persisted_zerodha_token()
     configured_token = str(zerodha_cfg.get("access_token", "")).strip()
-    access_token = session_token or configured_token
+    access_token = session_token or persisted_token or configured_token
 
     return ZerodhaClient(
         api_key=str(zerodha_cfg.get("api_key", "")),
         api_secret=str(zerodha_cfg.get("api_secret", "")),
         access_token=access_token,
     )
+
+
+def _ensure_runtime_kv_table():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_runtime_kv (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _load_persisted_zerodha_token() -> str:
+    try:
+        _ensure_runtime_kv_table()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_runtime_kv WHERE key = 'zerodha_access_token'")
+        row = cur.fetchone()
+        conn.close()
+        return str(row[0]).strip() if row and row[0] else ""
+    except Exception:
+        return ""
+
+
+def _persist_zerodha_token(token: str):
+    if not token:
+        return
+    _ensure_runtime_kv_table()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO app_runtime_kv (key, value, updated_at)
+        VALUES ('zerodha_access_token', ?, CURRENT_TIMESTAMP)
+        """,
+        (token,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _clear_persisted_zerodha_token():
+    try:
+        _ensure_runtime_kv_table()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM app_runtime_kv WHERE key = 'zerodha_access_token'")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def handle_zerodha_auth_callback():
@@ -108,6 +165,7 @@ def handle_zerodha_auth_callback():
         access_token = client.create_session(request_token)
         st.session_state["zerodha_access_token"] = access_token
         st.session_state["zerodha_last_request_token"] = request_token
+        _persist_zerodha_token(access_token)
 
         # Clean callback query params after successful auth.
         for key in ("request_token", "action", "status"):
@@ -116,6 +174,7 @@ def handle_zerodha_auth_callback():
 
         st.success("Zerodha connected successfully.")
     except Exception as exc:
+        _clear_persisted_zerodha_token()
         st.error(f"Zerodha authentication failed: {exc}")
 
 
@@ -384,6 +443,9 @@ with tab_market:
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
                 except Exception as exc:
+                    if "token" in str(exc).lower() or "auth" in str(exc).lower():
+                        _clear_persisted_zerodha_token()
+                        st.session_state.pop("zerodha_access_token", None)
                     st.error(f"Metrics refresh failed: {exc}")
 
     with col3:
@@ -422,6 +484,9 @@ with tab_market:
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
                 except Exception as exc:
+                    if "token" in str(exc).lower() or "auth" in str(exc).lower():
+                        _clear_persisted_zerodha_token()
+                        st.session_state.pop("zerodha_access_token", None)
                     st.error(f"Backtest failed: {exc}")
 
     if active_stocks:

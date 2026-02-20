@@ -272,16 +272,24 @@ class PaperTradingEngine:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT * FROM trades_simulated
-            WHERE status = 'open'
-            ORDER BY entry_date DESC, entry_time DESC
-        """)
-        
+
+        try:
+            cursor.execute("""
+                SELECT * FROM trades_simulated
+                WHERE status = 'open'
+                ORDER BY entry_date DESC, entry_time DESC
+            """)
+        except sqlite3.OperationalError:
+            # Backward-compat fallback for older DBs missing entry_time.
+            cursor.execute("""
+                SELECT * FROM trades_simulated
+                WHERE status = 'open'
+                ORDER BY entry_date DESC
+            """)
+
         trades = [dict(row) for row in cursor.fetchall()]
         conn.close()
-        
+
         return trades
     
     def get_position_summary(self) -> Dict:
@@ -385,29 +393,51 @@ def get_performance_metrics(db_path: str, period: str = 'all') -> Dict:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Build date filter
+    # Backward-compatible column detection for legacy DBs.
+    cursor.execute("PRAGMA table_info(trades_simulated)")
+    existing_cols = {row["name"] for row in cursor.fetchall()}
+
+    if "status" not in existing_cols:
+        conn.close()
+        return {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'win_rate': 0.0,
+            'avg_win_pct': 0.0,
+            'avg_loss_pct': 0.0,
+            'avg_win_loss_ratio': 0.0,
+            'net_pnl': 0.0,
+            'profit_factor': 0.0,
+            'best_trade_pct': 0.0,
+            'worst_trade_pct': 0.0,
+        }
+
+    date_col = "exit_date" if "exit_date" in existing_cols else "entry_date" if "entry_date" in existing_cols else None
     if period == 'today':
-        date_filter = "exit_date = date('now')"
+        date_filter = f"{date_col} = date('now')" if date_col else "1=1"
     elif period == 'week':
-        date_filter = "exit_date >= date('now', '-7 days')"
+        date_filter = f"{date_col} >= date('now', '-7 days')" if date_col else "1=1"
     elif period == 'month':
-        date_filter = "exit_date >= date('now', '-30 days')"
+        date_filter = f"{date_col} >= date('now', '-30 days')" if date_col else "1=1"
     else:
         date_filter = "1=1"
-    
-    # Get aggregate stats
+
+    profit_pct_expr = "profit_pct" if "profit_pct" in existing_cols else "0"
+    profit_loss_expr = "profit_loss" if "profit_loss" in existing_cols else "0"
+
     cursor.execute(f"""
-        SELECT 
+        SELECT
             COUNT(*) as total_trades,
             SUM(CASE WHEN status = 'win' THEN 1 ELSE 0 END) as winning_trades,
             SUM(CASE WHEN status = 'loss' THEN 1 ELSE 0 END) as losing_trades,
-            AVG(CASE WHEN status = 'win' THEN profit_pct ELSE NULL END) as avg_win_pct,
-            AVG(CASE WHEN status = 'loss' THEN profit_pct ELSE NULL END) as avg_loss_pct,
-            SUM(CASE WHEN status = 'win' THEN profit_loss ELSE 0 END) as total_wins_amt,
-            SUM(CASE WHEN status = 'loss' THEN profit_loss ELSE 0 END) as total_loss_amt,
-            SUM(profit_loss) as net_pnl,
-            MAX(profit_pct) as best_trade_pct,
-            MIN(profit_pct) as worst_trade_pct
+            AVG(CASE WHEN status = 'win' THEN {profit_pct_expr} ELSE NULL END) as avg_win_pct,
+            AVG(CASE WHEN status = 'loss' THEN {profit_pct_expr} ELSE NULL END) as avg_loss_pct,
+            SUM(CASE WHEN status = 'win' THEN {profit_loss_expr} ELSE 0 END) as total_wins_amt,
+            SUM(CASE WHEN status = 'loss' THEN {profit_loss_expr} ELSE 0 END) as total_loss_amt,
+            SUM({profit_loss_expr}) as net_pnl,
+            MAX({profit_pct_expr}) as best_trade_pct,
+            MIN({profit_pct_expr}) as worst_trade_pct
         FROM trades_simulated
         WHERE {date_filter}
         AND status IN ('win', 'loss', 'breakeven')

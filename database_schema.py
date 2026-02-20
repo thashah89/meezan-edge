@@ -356,6 +356,29 @@ def _run_compat_migrations(cursor):
         "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
     })
 
+    _ensure_columns(cursor, "trades_simulated", {
+        "entry_time": "TIME",
+        "exit_date": "DATE",
+        "exit_time": "TIME",
+        "exit_price": "REAL",
+        "exit_reason": "TEXT",
+        "mode": "TEXT",
+        "strategy": "TEXT",
+        "profit_loss": "REAL",
+        "profit_pct": "REAL",
+        "risk_amount": "REAL",
+        "reward_amount": "REAL",
+        "rr_ratio": "REAL",
+        "capital_used": "REAL",
+        "ml_win_prob": "REAL",
+        "ml_expected_return": "REAL",
+        "entry_rsi": "REAL",
+        "entry_adx": "REAL",
+        "entry_trend_score": "INTEGER",
+        "market_regime": "TEXT",
+        "closed_at": "TIMESTAMP",
+    })
+
     # Ensure pattern_signals exists for backend pattern learning.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS pattern_signals (

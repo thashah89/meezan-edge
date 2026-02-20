@@ -196,19 +196,6 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # View selector
-    view = st.radio(
-        "Select View",
-        [
-            "🔍 Market Intelligence",
-            "💼 Portfolio Engine", 
-            "🤖 AI Lab"
-        ],
-        label_visibility="collapsed"
-    )
-    
-    st.markdown("---")
-    
     # System status
     st.markdown("### 📊 System Status")
     
@@ -308,11 +295,18 @@ with st.sidebar:
     st.caption("v3.0 | Profit Maximization Mode")
     st.caption("Target: 15-25% monthly returns")
 
+# Main navigation tabs
+tab_market, tab_portfolio, tab_ai = st.tabs([
+    "🔍 Market Intelligence",
+    "💼 Portfolio Engine",
+    "🤖 AI Lab",
+])
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  VIEW 1: MARKET INTELLIGENCE ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-if "Market Intelligence" in view:
+with tab_market:
     st.markdown("<h1 class='main-header'>🔍 Market Intelligence Engine</h1>", unsafe_allow_html=True)
     st.markdown("**Autonomous market analysis and opportunity discovery**")
     st.markdown("---")
@@ -578,6 +572,61 @@ if "Market Intelligence" in view:
             st.warning("No opportunities found. Refresh metrics.")
     else:
         st.warning("No metrics available. Refresh data to analyze opportunities.")
+
+    st.markdown("---")
+    st.subheader("🧪 Backtest Report")
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                strategy_name,
+                period_start,
+                period_end,
+                total_trades,
+                winning_trades,
+                win_rate,
+                avg_return,
+                total_return,
+                updated_at
+            FROM strategy_performance
+            ORDER BY updated_at DESC
+            LIMIT 20
+            """
+        )
+        bt_rows = cursor.fetchall()
+        conn.close()
+
+        if bt_rows:
+            bt_df = pd.DataFrame([dict(r) for r in bt_rows])
+            bt_df = bt_df.rename(
+                columns={
+                    "strategy_name": "Strategy",
+                    "period_start": "From",
+                    "period_end": "To",
+                    "total_trades": "Trades",
+                    "winning_trades": "Wins",
+                    "win_rate": "Win Rate",
+                    "avg_return": "Avg Return",
+                    "total_return": "Total Return",
+                    "updated_at": "Updated At",
+                }
+            )
+            if "Win Rate" in bt_df.columns:
+                bt_df["Win Rate"] = bt_df["Win Rate"].apply(lambda x: f"{(x or 0) * 100:.1f}%")
+            if "Avg Return" in bt_df.columns:
+                bt_df["Avg Return"] = bt_df["Avg Return"].apply(lambda x: f"{(x or 0):.2f}%")
+            if "Total Return" in bt_df.columns:
+                bt_df["Total Return"] = bt_df["Total Return"].apply(lambda x: f"{(x or 0):.2f}%")
+            if "Strategy" in bt_df.columns:
+                bt_df["Strategy"] = bt_df["Strategy"].astype(str).str.replace("_", " ").str.title()
+
+            st.dataframe(bt_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No backtest report found yet. Run 'Backtest + AI Boost' first.")
+    except Exception as exc:
+        st.warning(f"Backtest report unavailable: {exc}")
     
     st.markdown("---")
     
@@ -629,7 +678,7 @@ if "Market Intelligence" in view:
 #  VIEW 2: AUTONOMOUS PORTFOLIO ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif "Portfolio Engine" in view:
+with tab_portfolio:
     st.markdown("<h1 class='main-header'>💼 Autonomous Portfolio Engine</h1>", unsafe_allow_html=True)
     st.markdown("**AI-driven capital management and trade execution**")
     st.markdown("---")
@@ -891,7 +940,7 @@ elif "Portfolio Engine" in view:
 #  VIEW 3: AI HEDGE FUND LAB
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif "AI Lab" in view:
+with tab_ai:
     st.markdown("<h1 class='main-header'>🤖 AI Hedge Fund Lab</h1>", unsafe_allow_html=True)
     st.markdown("**Self-learning intelligence engine**")
     st.markdown("---")

@@ -20,8 +20,6 @@ kiteconnect>=4.2.0
 python-dotenv>=1.0.0
 schedule>=1.2.0
 
-# Database
-sqlite3  # Built-in
-
-# Indicators
-ta-lib>=0.4.28  # Optional but recommended
+# NOTE:
+# - sqlite3 is part of Python stdlib (do not install via pip)
+# - ta-lib is intentionally omitted for Streamlit Cloud compatibility

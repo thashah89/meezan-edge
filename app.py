@@ -340,24 +340,34 @@ if "Market Intelligence" in view:
             if not symbols:
                 st.warning("Load stock universe first before refreshing metrics.")
             else:
-                with st.spinner("Fetching latest quotes from Zerodha..."):
-                    try:
-                        z_client = get_zerodha_client()
-                        result = z_client.refresh_latest_metrics(symbols)
-                        sectors_updated, sectors_missing = z_client.refresh_sector_buckets(symbols)
-                        st.session_state.metrics_updated_count = int(result.inserted_or_updated)
-                        st.success(
-                            f"Updated metrics for {result.inserted_or_updated} symbols "
-                            f"and sectors for {sectors_updated} symbols."
+                progress_bar = st.progress(0, text="Starting metrics refresh...")
+                try:
+                    z_client = get_zerodha_client()
+
+                    def _on_progress(done: int, total: int, sym: str, status: str):
+                        ratio = 0.0 if total <= 0 else done / total
+                        progress_bar.progress(
+                            min(1.0, ratio),
+                            text=f"Refreshing metrics {done}/{total}: {sym} ({status})",
                         )
-                        if result.failed:
-                            st.warning(f"Failed for {result.failed} symbols.")
-                        if sectors_missing:
-                            st.info(f"Could not resolve sector for {sectors_missing} symbols.")
-                    except ZerodhaConfigError as exc:
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.error(f"Metrics refresh failed: {exc}")
+
+                    result = z_client.refresh_latest_metrics(symbols, progress_cb=_on_progress)
+                    progress_bar.progress(1.0, text="Refreshing sector buckets...")
+
+                    sectors_updated, sectors_missing = z_client.refresh_sector_buckets(symbols)
+                    st.session_state.metrics_updated_count = int(result.inserted_or_updated)
+                    st.success(
+                        f"Updated metrics for {result.inserted_or_updated} symbols "
+                        f"and sectors for {sectors_updated} symbols."
+                    )
+                    if result.failed:
+                        st.warning(f"Failed for {result.failed} symbols.")
+                    if sectors_missing:
+                        st.info(f"Could not resolve sector for {sectors_missing} symbols.")
+                except ZerodhaConfigError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Metrics refresh failed: {exc}")
 
     if active_stocks:
         # Check validity

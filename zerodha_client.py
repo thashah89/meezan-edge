@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import logging
 import pandas as pd
 
@@ -102,7 +102,11 @@ class ZerodhaClient:
 
         return out
 
-    def refresh_latest_metrics(self, symbols: List[str]) -> RefreshResult:
+    def refresh_latest_metrics(
+        self,
+        symbols: List[str],
+        progress_cb: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> RefreshResult:
         """
         Pull latest quote snapshot and upsert into stock_metrics.
         """
@@ -125,18 +129,30 @@ class ZerodhaClient:
         failed = 0
         failures: List[Tuple[str, str]] = []
 
+        total = len(symbols)
+        processed = 0
+
         try:
             for raw_symbol in symbols:
                 symbol = self.normalize_symbol(raw_symbol)
+                status = "updated"
                 if not symbol:
                     failed += 1
                     failures.append((str(raw_symbol), "Invalid symbol"))
+                    status = "invalid"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, str(raw_symbol), status)
                     continue
 
                 q = quotes.get(symbol)
                 if not q:
                     failed += 1
                     failures.append((symbol, "No quote received"))
+                    status = "failed"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, symbol, status)
                     continue
 
                 try:
@@ -204,6 +220,11 @@ class ZerodhaClient:
                 except Exception as exc:
                     failed += 1
                     failures.append((symbol, str(exc)))
+                    status = "failed"
+
+                processed += 1
+                if progress_cb:
+                    progress_cb(processed, total, symbol, status)
 
             conn.commit()
         except Exception:

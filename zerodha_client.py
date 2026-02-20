@@ -114,18 +114,26 @@ class ZerodhaClient:
         """
         Pull latest quote snapshot and upsert into stock_metrics.
         """
-        quotes = self.fetch_quotes(symbols)
         today = date.today().isoformat()
         instrument_token_by_symbol: Dict[str, int] = {}
+        alias_to_tradingsymbol: Dict[str, str] = {}
+        resolved_by_input: Dict[str, str] = {}
         try:
             instruments = self.kite.instruments("NSE")
-            for row in instruments:
-                tradingsymbol = self.normalize_symbol(str(row.get("tradingsymbol", "")))
-                token = row.get("instrument_token")
-                if tradingsymbol and token:
-                    instrument_token_by_symbol[tradingsymbol] = int(token)
+            instrument_token_by_symbol, alias_to_tradingsymbol = self._build_instrument_resolution_maps(instruments)
+            for raw_symbol in symbols:
+                base_symbol = self.normalize_symbol(raw_symbol)
+                resolved = self._resolve_to_tradingsymbol(
+                    base_symbol,
+                    instrument_token_by_symbol,
+                    alias_to_tradingsymbol,
+                )
+                if resolved:
+                    resolved_by_input[base_symbol] = resolved
         except Exception as exc:
             log.warning("Could not preload instruments for indicator enrichment: %s", exc)
+        resolved_universe = list({v for v in resolved_by_input.values() if v})
+        quotes = self.fetch_quotes(resolved_universe) if resolved_universe else {}
 
         conn = get_connection()
         cur = conn.cursor()
@@ -149,7 +157,17 @@ class ZerodhaClient:
                         progress_cb(processed, total, str(raw_symbol), status)
                     continue
 
-                q = quotes.get(symbol)
+                resolved_symbol = resolved_by_input.get(symbol, "")
+                if not resolved_symbol:
+                    failed += 1
+                    failures.append((symbol, "Instrument token not found"))
+                    status = "failed"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, symbol, status)
+                    continue
+
+                q = quotes.get(resolved_symbol)
                 if not q:
                     failed += 1
                     failures.append((symbol, "No quote received"))
@@ -161,7 +179,7 @@ class ZerodhaClient:
 
                 try:
                     row = self._quote_to_metrics_row(symbol, q)
-                    token = instrument_token_by_symbol.get(symbol)
+                    token = instrument_token_by_symbol.get(resolved_symbol)
                     if token:
                         row = self._enrich_row_with_history(token, row)
                     row = self._apply_ml_predictions(row)
@@ -339,12 +357,9 @@ class ZerodhaClient:
         }
 
         instrument_token_by_symbol: Dict[str, int] = {}
+        alias_to_tradingsymbol: Dict[str, str] = {}
         instruments = self.kite.instruments("NSE")
-        for row in instruments:
-            tradingsymbol = self.normalize_symbol(str(row.get("tradingsymbol", "")))
-            token = row.get("instrument_token")
-            if tradingsymbol and token:
-                instrument_token_by_symbol[tradingsymbol] = int(token)
+        instrument_token_by_symbol, alias_to_tradingsymbol = self._build_instrument_resolution_maps(instruments)
 
         conn = get_connection()
         cur = conn.cursor()
@@ -365,6 +380,13 @@ class ZerodhaClient:
                     continue
 
                 token = instrument_token_by_symbol.get(symbol)
+                if not token:
+                    resolved_symbol = self._resolve_to_tradingsymbol(
+                        symbol,
+                        instrument_token_by_symbol,
+                        alias_to_tradingsymbol,
+                    )
+                    token = instrument_token_by_symbol.get(resolved_symbol) if resolved_symbol else None
                 if not token:
                     failed_symbols += 1
                     failures.append((symbol, "Instrument token not found"))
@@ -970,3 +992,43 @@ class ZerodhaClient:
                     1,
                 ),
             )
+
+    @staticmethod
+    def _build_instrument_resolution_maps(instruments: List[Dict]) -> Tuple[Dict[str, int], Dict[str, str]]:
+        """
+        Build maps to resolve loaded symbols to Zerodha tradingsymbols.
+        Handles SME-style suffixes such as '-SM' and '-BE'.
+        """
+        token_by_tradingsymbol: Dict[str, int] = {}
+        base_candidates: Dict[str, Optional[str]] = {}
+
+        for row in instruments:
+            tradingsymbol = str(row.get("tradingsymbol", "")).strip().upper()
+            token = row.get("instrument_token")
+            if not tradingsymbol or not token:
+                continue
+
+            token_by_tradingsymbol[tradingsymbol] = int(token)
+
+            base = tradingsymbol.split("-", 1)[0]
+            if base not in base_candidates:
+                base_candidates[base] = tradingsymbol
+            elif base_candidates[base] != tradingsymbol:
+                base_candidates[base] = None
+
+        alias_to_tradingsymbol: Dict[str, str] = {}
+        for base, mapped in base_candidates.items():
+            if mapped and base not in token_by_tradingsymbol:
+                alias_to_tradingsymbol[base] = mapped
+
+        return token_by_tradingsymbol, alias_to_tradingsymbol
+
+    @staticmethod
+    def _resolve_to_tradingsymbol(
+        symbol: str,
+        token_by_tradingsymbol: Dict[str, int],
+        alias_to_tradingsymbol: Dict[str, str],
+    ) -> str:
+        if symbol in token_by_tradingsymbol:
+            return symbol
+        return alias_to_tradingsymbol.get(symbol, "")

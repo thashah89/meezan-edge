@@ -268,6 +268,9 @@ def init_database():
         # Create indexes
         for index in INDEXES:
             cursor.execute(index)
+
+        # Lightweight migrations for older DB files
+        _run_compat_migrations(cursor)
         
         # Record schema version
         cursor.execute(
@@ -285,6 +288,62 @@ def init_database():
         return False
     finally:
         conn.close()
+
+
+def _table_columns(cursor, table_name: str) -> set[str]:
+    """Return existing column names for a table."""
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return {row[1] for row in cursor.fetchall()}
+
+
+def _ensure_columns(cursor, table_name: str, columns: dict[str, str]):
+    """Add missing columns via ALTER TABLE for backward compatibility."""
+    existing = _table_columns(cursor, table_name)
+    for col, col_def in columns.items():
+        if col not in existing:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} {col_def}")
+
+
+def _run_compat_migrations(cursor):
+    """
+    Ensure older databases contain columns required by current app code.
+    This avoids runtime OperationalError when an old DB file is deployed.
+    """
+    _ensure_columns(cursor, "stocks_master", {
+        "sector": "TEXT",
+        "exchange": "TEXT DEFAULT 'NSE'",
+        "load_date": "DATE",
+        "valid_till": "DATE",
+        "is_active": "BOOLEAN DEFAULT 1",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    })
+
+    _ensure_columns(cursor, "stock_metrics", {
+        "open": "REAL",
+        "high": "REAL",
+        "low": "REAL",
+        "close": "REAL",
+        "volume": "INTEGER",
+        "macd_signal": "REAL",
+        "sma_20": "REAL",
+        "sma_50": "REAL",
+        "sma_200": "REAL",
+        "ema_9": "REAL",
+        "ema_21": "REAL",
+        "bb_upper": "REAL",
+        "bb_middle": "REAL",
+        "bb_lower": "REAL",
+        "bb_width": "REAL",
+        "momentum_score": "INTEGER",
+        "volatility_score": "INTEGER",
+        "liquidity_score": "INTEGER",
+        "volume_ratio": "REAL",
+        "win_probability": "REAL",
+        "expected_return": "REAL",
+        "strategy_fit": "TEXT",
+        "confidence": "REAL",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    })
 
 
 def reset_database():

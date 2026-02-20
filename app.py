@@ -25,6 +25,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, date, timedelta
 import logging
+import threading
 
 # Configure page
 st.set_page_config(
@@ -41,7 +42,7 @@ from market_intel_engine import MarketIntelligenceEngine
 from capital_allocator import CapitalAllocator, RiskManager
 from trade_selector import TradeSelector
 from paper_trader import PaperTradingEngine, get_performance_metrics
-from ml_trainer import MLTrainer, MLPredictor
+from ml_trainer import MLTrainer, MLPredictor, auto_train_if_due
 from halal_scraper import scrape_halal_stocks
 from zerodha_client import ZerodhaClient, ZerodhaConfigError
 
@@ -119,6 +120,19 @@ def handle_zerodha_auth_callback():
 
 
 handle_zerodha_auth_callback()
+
+
+def _run_backend_training():
+    """Kick off due training checks; safe to run in background thread."""
+    try:
+        auto_train_if_due(
+            db_path=config.DB_PATH,
+            min_total_trades=config.MIN_TRADES_FOR_TRAINING,
+            min_new_trades=20,
+            retrain_every_days=1,
+        )
+    except Exception as exc:
+        log.warning("Background retrain skipped: %s", exc)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CUSTOM CSS
@@ -371,6 +385,7 @@ if "Market Intelligence" in view:
                     progress_bar.progress(1.0, text="Refreshing sector buckets...")
 
                     z_client.refresh_sector_buckets(symbols)
+                    threading.Thread(target=_run_backend_training, daemon=True).start()
                     st.rerun()
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))

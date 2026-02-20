@@ -221,6 +221,17 @@ TABLES = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
+
+    "pattern_signals": """
+        CREATE TABLE IF NOT EXISTS pattern_signals (
+            pattern_key TEXT PRIMARY KEY,
+            trades INTEGER,
+            wins INTEGER,
+            win_rate REAL,
+            avg_return REAL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
     
     "schema_version": """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -344,6 +355,18 @@ def _run_compat_migrations(cursor):
         "confidence": "REAL",
         "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
     })
+
+    # Ensure pattern_signals exists for backend pattern learning.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_signals (
+            pattern_key TEXT PRIMARY KEY,
+            trades INTEGER,
+            wins INTEGER,
+            win_rate REAL,
+            avg_return REAL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 
 def reset_database():

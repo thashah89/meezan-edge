@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover
 
 from database_schema import get_connection
 from utils_indicators import add_indicators
+from ml_trainer import MLPredictor
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class ZerodhaClient:
         self.kite = KiteConnect(api_key=self.api_key)
         if self.access_token:
             self.kite.set_access_token(self.access_token)
+        self.predictor = MLPredictor()
 
     @property
     def is_authenticated(self) -> bool:
@@ -160,6 +162,7 @@ class ZerodhaClient:
                     token = instrument_token_by_symbol.get(symbol)
                     if token:
                         row = self._enrich_row_with_history(token, row)
+                    row = self._apply_ml_predictions(row)
                     cur.execute(
                         """
                         INSERT OR REPLACE INTO stock_metrics
@@ -457,6 +460,37 @@ class ZerodhaClient:
         except Exception as exc:
             log.debug("Indicator enrichment failed for token %s: %s", instrument_token, exc)
             return row
+
+    def _apply_ml_predictions(self, row: Dict) -> Dict:
+        """
+        Apply trained-model inference to overwrite default win/profit predictions.
+        """
+        try:
+            rr_ratio = 2.0
+            atr = float(row.get("atr", 0.0) or 0.0)
+            ltp = float(row.get("ltp", 0.0) or 0.0)
+            if atr > 0 and ltp > 0:
+                risk_pct = (atr / ltp) * 100.0
+                if risk_pct > 0:
+                    rr_ratio = max(1.0, min(4.0, (2.0 * risk_pct) / risk_pct))
+
+            feat = {
+                "rsi": float(row.get("rsi", 50.0)),
+                "adx": float(row.get("adx", 20.0)),
+                "trend_score": float(row.get("trend_score", 50.0)),
+                "rr_ratio": float(rr_ratio),
+                "rsi_oversold": 1 if float(row.get("rsi", 50.0)) < 30 else 0,
+                "rsi_overbought": 1 if float(row.get("rsi", 50.0)) > 70 else 0,
+                "adx_strong": 1 if float(row.get("adx", 20.0)) > 30 else 0,
+                "strong_trend": 1 if float(row.get("trend_score", 50.0)) > 70 else 0,
+                "is_intraday": 1,
+                "rsi_adx": float(row.get("rsi", 50.0)) * float(row.get("adx", 20.0)) / 100.0,
+            }
+            row["win_probability"] = float(self.predictor.predict_win_prob(feat))
+            row["expected_return"] = float(self.predictor.predict_profit(feat))
+        except Exception as exc:
+            log.debug("ML inference fallback used: %s", exc)
+        return row
 
     @staticmethod
     def classify_sector_bucket(name: str, symbol: str = "") -> str:

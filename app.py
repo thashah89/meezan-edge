@@ -323,7 +323,7 @@ if "Market Intelligence" in view:
     active_stocks = get_active_stocks()
     symbols = [s["symbol"] for s in active_stocks]
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         if st.button("📥 Load Stocks", use_container_width=True):
@@ -392,6 +392,44 @@ if "Market Intelligence" in view:
                 except Exception as exc:
                     st.error(f"Metrics refresh failed: {exc}")
 
+    with col3:
+        if st.button("🧪 Backtest + AI Boost", use_container_width=True):
+            if not symbols:
+                st.warning("Load stock universe first before backtesting.")
+            else:
+                progress_bar = st.progress(0, text="Starting strategy backtest...")
+                try:
+                    z_client = get_zerodha_client()
+
+                    def _on_backtest_progress(done: int, total: int, sym: str, status: str):
+                        ratio = 0.0 if total <= 0 else done / total
+                        progress_bar.progress(
+                            min(1.0, ratio),
+                            text=f"Backtesting {done}/{total}: {sym} ({status})",
+                        )
+
+                    bt_result = z_client.run_backtest_ai_calibration(
+                        symbols=symbols,
+                        lookback_days=260,
+                        hold_days=5,
+                        progress_cb=_on_backtest_progress,
+                    )
+                    progress_bar.progress(1.0, text="Backtest complete.")
+                    st.success(
+                        f"Backtest + AI calibration updated {bt_result['updated_symbols']} symbols"
+                        f" (failed: {bt_result['failed_symbols']})."
+                    )
+                    if bt_result.get("strategy_distribution"):
+                        dist = ", ".join(
+                            [f"{k}: {v}" for k, v in sorted(bt_result["strategy_distribution"].items())]
+                        )
+                        st.caption(f"Strategy distribution: {dist}")
+                    st.rerun()
+                except ZerodhaConfigError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Backtest failed: {exc}")
+
     if active_stocks:
         # Show stocks + metrics table directly
         st.markdown("#### 📋 Stocks")
@@ -414,7 +452,51 @@ if "Market Intelligence" in view:
         if merged_df.empty:
             st.info("No successful metric rows to display yet. Click Refresh Metrics.")
         else:
-            st.dataframe(merged_df, use_container_width=True, hide_index=True)
+            preferred_order = [
+                "symbol", "company", "sector",
+                "ltp", "opportunity_score", "strategy_fit", "win_probability", "expected_return",
+                "rsi", "adx", "macd", "macd_signal",
+                "sma_20", "sma_50", "sma_200", "ema_9", "ema_21",
+                "atr", "bb_upper", "bb_middle", "bb_lower", "bb_width",
+                "trend_score", "momentum_score", "volatility_score", "liquidity_score",
+                "volume_ratio", "date"
+            ]
+            front = [c for c in preferred_order if c in merged_df.columns]
+            rest = [c for c in merged_df.columns if c not in front]
+            display_df = merged_df[front + rest].copy()
+
+            header_map = {
+                "symbol": "Symbol",
+                "company": "Company",
+                "sector": "Sector",
+                "ltp": "LTP",
+                "opportunity_score": "Opportunity Score",
+                "strategy_fit": "Strategy Fit",
+                "win_probability": "Win Probability",
+                "expected_return": "Expected Return",
+                "rsi": "RSI",
+                "adx": "ADX",
+                "macd": "MACD",
+                "macd_signal": "MACD Signal",
+                "sma_20": "SMA 20",
+                "sma_50": "SMA 50",
+                "sma_200": "SMA 200",
+                "ema_9": "EMA 9",
+                "ema_21": "EMA 21",
+                "atr": "ATR",
+                "bb_upper": "BB Upper",
+                "bb_middle": "BB Middle",
+                "bb_lower": "BB Lower",
+                "bb_width": "BB Width",
+                "trend_score": "Trend Score",
+                "momentum_score": "Momentum Score",
+                "volatility_score": "Volatility Score",
+                "liquidity_score": "Liquidity Score",
+                "volume_ratio": "Volume Ratio",
+                "date": "Date",
+            }
+            display_df = display_df.rename(columns=header_map)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
     
     else:
         st.info("No data loaded")

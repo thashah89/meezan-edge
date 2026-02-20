@@ -9,6 +9,7 @@ from datetime import date, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 import logging
 import pandas as pd
+import numpy as np
 
 try:
     from kiteconnect import KiteConnect
@@ -18,6 +19,7 @@ except ImportError:  # pragma: no cover
 from database_schema import get_connection
 from utils_indicators import add_indicators
 from ml_trainer import MLPredictor
+from market_intel_engine import calculate_opportunity_score, determine_strategy_fit
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +165,8 @@ class ZerodhaClient:
                     if token:
                         row = self._enrich_row_with_history(token, row)
                     row = self._apply_ml_predictions(row)
+                    row["strategy_fit"] = determine_strategy_fit(row)
+                    row["opportunity_score"] = calculate_opportunity_score(row)
                     cur.execute(
                         """
                         INSERT OR REPLACE INTO stock_metrics
@@ -171,7 +175,7 @@ class ZerodhaClient:
                             rsi, adx, macd, macd_signal,
                             sma_20, sma_50, sma_200, ema_9, ema_21,
                             atr, bb_upper, bb_middle, bb_lower, bb_width, trend_score,
-                            momentum_score, volatility_score, liquidity_score,
+                            momentum_score, volatility_score, liquidity_score, opportunity_score,
                             volume_ratio, win_probability, expected_return,
                             strategy_fit, confidence, updated_at
                         )
@@ -181,7 +185,7 @@ class ZerodhaClient:
                             ?, ?, ?, ?,
                             ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, CURRENT_TIMESTAMP
                         )
                         """,
@@ -212,6 +216,7 @@ class ZerodhaClient:
                             row["momentum_score"],
                             row["volatility_score"],
                             row["liquidity_score"],
+                            row["opportunity_score"],
                             row["volume_ratio"],
                             row["win_probability"],
                             row["expected_return"],
@@ -298,6 +303,202 @@ class ZerodhaClient:
             conn.close()
 
         return (updated, missing)
+
+    def run_backtest_ai_calibration(
+        self,
+        symbols: List[str],
+        lookback_days: int = 260,
+        hold_days: int = 5,
+        progress_cb: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> Dict:
+        """
+        Run historical strategy backtest per symbol and blend with ML predictions
+        to recalibrate strategy_fit/confidence/win_probability/expected_return.
+        """
+        if not self.is_authenticated:
+            raise ZerodhaConfigError("Zerodha access token is missing. Authenticate first.")
+        if not symbols:
+            return {
+                "updated_symbols": 0,
+                "failed_symbols": 0,
+                "failures": [],
+                "strategy_distribution": {},
+            }
+
+        today = date.today().isoformat()
+        from_date = date.today() - timedelta(days=max(120, lookback_days))
+        failures: List[Tuple[str, str]] = []
+        updated_symbols = 0
+        failed_symbols = 0
+        strategy_distribution: Dict[str, int] = {}
+        global_stats = {
+            "momentum": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            "breakout": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            "swing": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            "mean_revert": {"trades": 0, "wins": 0, "sum_return": 0.0},
+        }
+
+        instrument_token_by_symbol: Dict[str, int] = {}
+        instruments = self.kite.instruments("NSE")
+        for row in instruments:
+            tradingsymbol = self.normalize_symbol(str(row.get("tradingsymbol", "")))
+            token = row.get("instrument_token")
+            if tradingsymbol and token:
+                instrument_token_by_symbol[tradingsymbol] = int(token)
+
+        conn = get_connection()
+        cur = conn.cursor()
+        total = len(symbols)
+        processed = 0
+
+        try:
+            for raw_symbol in symbols:
+                symbol = self.normalize_symbol(raw_symbol)
+                status = "updated"
+                if not symbol:
+                    failed_symbols += 1
+                    failures.append((str(raw_symbol), "Invalid symbol"))
+                    status = "invalid"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, str(raw_symbol), status)
+                    continue
+
+                token = instrument_token_by_symbol.get(symbol)
+                if not token:
+                    failed_symbols += 1
+                    failures.append((symbol, "Instrument token not found"))
+                    status = "missing_token"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, symbol, status)
+                    continue
+
+                try:
+                    candles = self.kite.historical_data(
+                        instrument_token=token,
+                        from_date=from_date,
+                        to_date=date.today(),
+                        interval="day",
+                    )
+                    if not candles:
+                        raise ValueError("No historical candles")
+                    hist_df = pd.DataFrame(candles)
+                    if hist_df.empty or len(hist_df) < 80:
+                        raise ValueError("Insufficient historical candles")
+
+                    ind_df = add_indicators(hist_df)
+                    if ind_df.empty or len(ind_df) < 80:
+                        raise ValueError("Indicator enrichment failed")
+
+                    backtest = self._backtest_strategies(ind_df, hold_days=hold_days)
+                    for s_name, s_data in backtest.items():
+                        global_stats[s_name]["trades"] += int(s_data["trades"])
+                        global_stats[s_name]["wins"] += int(s_data["wins"])
+                        global_stats[s_name]["sum_return"] += float(s_data["sum_return"])
+
+                    best_strategy, best_info = self._pick_best_strategy(backtest)
+
+                    latest = ind_df.iloc[-1]
+                    row_snapshot = self._latest_metric_snapshot(cur, symbol)
+                    if not row_snapshot:
+                        raise ValueError("No latest metric row found. Run Refresh Metrics first.")
+
+                    enriched = self._merge_indicator_snapshot(row_snapshot, latest)
+                    ai_win, ai_profit = self._predict_from_row(enriched)
+                    bt_win = float(best_info.get("win_rate", 0.5))
+                    bt_profit = float(best_info.get("avg_return", 0.0))
+                    trade_count = int(best_info.get("trades", 0))
+                    bt_weight = float(min(0.75, max(0.25, trade_count / 40.0)))
+
+                    final_win = (bt_weight * bt_win) + ((1.0 - bt_weight) * ai_win)
+                    final_profit = (bt_weight * bt_profit) + ((1.0 - bt_weight) * ai_profit)
+                    final_confidence = min(
+                        99.0,
+                        max(45.0, 42.0 + (trade_count * 0.9) + (final_win * 30.0) + min(10.0, abs(final_profit) * 2.0)),
+                    )
+
+                    if best_strategy == "none":
+                        final_strategy = determine_strategy_fit(enriched)
+                    else:
+                        final_strategy = best_strategy
+
+                    enriched["win_probability"] = max(0.01, min(0.99, float(final_win)))
+                    enriched["expected_return"] = float(final_profit)
+                    enriched["confidence"] = float(final_confidence)
+                    enriched["strategy_fit"] = final_strategy
+                    enriched["opportunity_score"] = int(calculate_opportunity_score(enriched))
+
+                    metric_date = row_snapshot.get("date") or today
+                    cur.execute(
+                        """
+                        UPDATE stock_metrics
+                        SET
+                            rsi = ?, adx = ?, macd = ?, macd_signal = ?,
+                            sma_20 = ?, sma_50 = ?, sma_200 = ?, ema_9 = ?, ema_21 = ?,
+                            atr = ?, bb_upper = ?, bb_middle = ?, bb_lower = ?, bb_width = ?,
+                            trend_score = ?, momentum_score = ?, volatility_score = ?, liquidity_score = ?,
+                            volume_ratio = ?, strategy_fit = ?, win_probability = ?, expected_return = ?,
+                            confidence = ?, opportunity_score = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE symbol = ? AND date = ?
+                        """,
+                        (
+                            enriched["rsi"],
+                            enriched["adx"],
+                            enriched["macd"],
+                            enriched["macd_signal"],
+                            enriched["sma_20"],
+                            enriched["sma_50"],
+                            enriched["sma_200"],
+                            enriched["ema_9"],
+                            enriched["ema_21"],
+                            enriched["atr"],
+                            enriched["bb_upper"],
+                            enriched["bb_middle"],
+                            enriched["bb_lower"],
+                            enriched["bb_width"],
+                            enriched["trend_score"],
+                            enriched["momentum_score"],
+                            enriched["volatility_score"],
+                            enriched["liquidity_score"],
+                            enriched["volume_ratio"],
+                            enriched["strategy_fit"],
+                            enriched["win_probability"],
+                            enriched["expected_return"],
+                            enriched["confidence"],
+                            enriched["opportunity_score"],
+                            symbol,
+                            metric_date,
+                        ),
+                    )
+                    if cur.rowcount <= 0:
+                        raise ValueError("No row updated")
+
+                    strategy_distribution[final_strategy] = strategy_distribution.get(final_strategy, 0) + 1
+                    updated_symbols += 1
+                except Exception as exc:
+                    failed_symbols += 1
+                    failures.append((symbol, str(exc)))
+                    status = "failed"
+
+                processed += 1
+                if progress_cb:
+                    progress_cb(processed, total, symbol, status)
+
+            self._persist_strategy_backtest_rollup(cur, global_stats, from_date.isoformat(), today)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return {
+            "updated_symbols": updated_symbols,
+            "failed_symbols": failed_symbols,
+            "failures": failures,
+            "strategy_distribution": strategy_distribution,
+        }
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
@@ -532,3 +733,240 @@ class ZerodhaClient:
                 return sector
 
         return "Other"
+
+    def _latest_metric_snapshot(self, cur, symbol: str) -> Optional[Dict]:
+        cur.execute(
+            """
+            SELECT * FROM stock_metrics
+            WHERE symbol = ?
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def _safe_float(value, fallback: float = 0.0) -> float:
+        if value is None:
+            return float(fallback)
+        try:
+            if pd.isna(value):
+                return float(fallback)
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except Exception:
+            return float(fallback)
+
+    @classmethod
+    def _merge_indicator_snapshot(cls, base_row: Dict, latest) -> Dict:
+        out = dict(base_row)
+        close = cls._safe_float(latest.get("close"), cls._safe_float(base_row.get("close"), 0.0))
+        high = cls._safe_float(latest.get("high"), cls._safe_float(base_row.get("high"), close))
+        low = cls._safe_float(latest.get("low"), cls._safe_float(base_row.get("low"), close))
+        volume = int(cls._safe_float(latest.get("volume"), cls._safe_float(base_row.get("volume"), 0.0)))
+        sma20 = cls._safe_float(latest.get("SMA_20"), cls._safe_float(base_row.get("sma_20"), close))
+        sma50 = cls._safe_float(latest.get("SMA_50"), cls._safe_float(base_row.get("sma_50"), close))
+        sma200 = cls._safe_float(latest.get("SMA_200"), cls._safe_float(base_row.get("sma_200"), close))
+        ema9 = cls._safe_float(latest.get("EMA_9"), cls._safe_float(base_row.get("ema_9"), close))
+        ema21 = cls._safe_float(latest.get("EMA_21"), cls._safe_float(base_row.get("ema_21"), close))
+        atr = max(0.01, cls._safe_float(latest.get("ATR"), cls._safe_float(base_row.get("atr"), abs(high - low))))
+        bb_upper = cls._safe_float(latest.get("BB_Upper"), cls._safe_float(base_row.get("bb_upper"), close + (2 * atr)))
+        bb_lower = cls._safe_float(latest.get("BB_Lower"), cls._safe_float(base_row.get("bb_lower"), max(0.01, close - (2 * atr))))
+        bb_width = cls._safe_float(latest.get("BB_Width"), cls._safe_float(base_row.get("bb_width"), 0.0))
+        volume_ratio = cls._safe_float(latest.get("Volume_Ratio"), cls._safe_float(base_row.get("volume_ratio"), 1.0))
+        rsi = cls._safe_float(latest.get("RSI"), cls._safe_float(base_row.get("rsi"), 50.0))
+        adx = cls._safe_float(latest.get("ADX"), cls._safe_float(base_row.get("adx"), 20.0))
+        macd = cls._safe_float(latest.get("MACD"), cls._safe_float(base_row.get("macd"), 0.0))
+        macd_signal = cls._safe_float(latest.get("MACD_Signal"), cls._safe_float(base_row.get("macd_signal"), 0.0))
+
+        trend_score = 0
+        trend_score += 35 if close > sma20 else 0
+        trend_score += 35 if close > sma50 else 0
+        trend_score += 30 if sma50 > sma200 else 0
+        trend_score = int(min(100, max(0, trend_score)))
+        momentum_score = int(min(100, max(0, ((rsi / 100.0) * 60.0) + (20.0 if macd > macd_signal else 0.0) + (20.0 if adx > 20 else 0.0))))
+        atr_pct = (atr / close * 100.0) if close > 0 else 0.0
+        volatility_score = int(min(100, max(0, 100.0 - abs(3.0 - atr_pct) * 20.0)))
+        liquidity_score = 90 if volume > 1_000_000 else 75 if volume > 100_000 else 60
+
+        out.update(
+            {
+                "ltp": close,
+                "close": close,
+                "high": high,
+                "low": low,
+                "volume": volume,
+                "rsi": rsi,
+                "adx": adx,
+                "macd": macd,
+                "macd_signal": macd_signal,
+                "sma_20": sma20,
+                "sma_50": sma50,
+                "sma_200": sma200,
+                "ema_9": ema9,
+                "ema_21": ema21,
+                "atr": atr,
+                "bb_upper": bb_upper,
+                "bb_middle": sma20,
+                "bb_lower": bb_lower,
+                "bb_width": bb_width,
+                "trend_score": trend_score,
+                "momentum_score": momentum_score,
+                "volatility_score": volatility_score,
+                "liquidity_score": liquidity_score,
+                "volume_ratio": volume_ratio,
+            }
+        )
+        return out
+
+    def _predict_from_row(self, row: Dict) -> Tuple[float, float]:
+        rr_ratio = 2.0
+        atr = self._safe_float(row.get("atr"), 0.0)
+        ltp = self._safe_float(row.get("ltp"), 0.0)
+        if atr > 0 and ltp > 0:
+            risk_pct = (atr / ltp) * 100.0
+            if risk_pct > 0:
+                rr_ratio = max(1.0, min(4.0, (2.0 * risk_pct) / risk_pct))
+
+        feat = {
+            "rsi": self._safe_float(row.get("rsi"), 50.0),
+            "adx": self._safe_float(row.get("adx"), 20.0),
+            "trend_score": self._safe_float(row.get("trend_score"), 50.0),
+            "rr_ratio": rr_ratio,
+            "rsi_oversold": 1 if self._safe_float(row.get("rsi"), 50.0) < 30 else 0,
+            "rsi_overbought": 1 if self._safe_float(row.get("rsi"), 50.0) > 70 else 0,
+            "adx_strong": 1 if self._safe_float(row.get("adx"), 20.0) > 30 else 0,
+            "strong_trend": 1 if self._safe_float(row.get("trend_score"), 50.0) > 70 else 0,
+            "is_intraday": 1,
+            "rsi_adx": (self._safe_float(row.get("rsi"), 50.0) * self._safe_float(row.get("adx"), 20.0)) / 100.0,
+        }
+        ai_win = float(self.predictor.predict_win_prob(feat))
+        ai_profit = float(self.predictor.predict_profit(feat))
+        return ai_win, ai_profit
+
+    def _backtest_strategies(self, ind_df: pd.DataFrame, hold_days: int = 5) -> Dict[str, Dict]:
+        stats = {
+            "momentum": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            "breakout": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            "swing": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            "mean_revert": {"trades": 0, "wins": 0, "sum_return": 0.0},
+        }
+        if ind_df.empty or len(ind_df) <= hold_days + 60:
+            return {k: {"trades": 0, "wins": 0, "win_rate": 0.5, "avg_return": 0.0, "sum_return": 0.0} for k in stats}
+
+        for i in range(60, len(ind_df) - hold_days):
+            row = ind_df.iloc[i]
+            entry = self._safe_float(row.get("close"), 0.0)
+            if entry <= 0:
+                continue
+            exit_price = self._safe_float(ind_df.iloc[i + hold_days].get("close"), entry)
+            ret_pct = ((exit_price - entry) / entry) * 100.0
+
+            for strat in stats.keys():
+                if self._strategy_signal(row, strat):
+                    stats[strat]["trades"] += 1
+                    stats[strat]["sum_return"] += ret_pct
+                    if ret_pct > 0:
+                        stats[strat]["wins"] += 1
+
+        out = {}
+        for strat, agg in stats.items():
+            trades = int(agg["trades"])
+            wins = int(agg["wins"])
+            win_rate = (wins / trades) if trades > 0 else 0.5
+            avg_return = (float(agg["sum_return"]) / trades) if trades > 0 else 0.0
+            out[strat] = {
+                "trades": trades,
+                "wins": wins,
+                "win_rate": float(win_rate),
+                "avg_return": float(avg_return),
+                "sum_return": float(agg["sum_return"]),
+            }
+        return out
+
+    @classmethod
+    def _strategy_signal(cls, row, strategy: str) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        macd = cls._safe_float(row.get("MACD"), 0.0)
+        macd_signal = cls._safe_float(row.get("MACD_Signal"), 0.0)
+        sma20 = cls._safe_float(row.get("SMA_20"), close)
+        sma50 = cls._safe_float(row.get("SMA_50"), close)
+        sma200 = cls._safe_float(row.get("SMA_200"), close)
+        bb_width_raw = cls._safe_float(row.get("BB_Width"), 0.0)
+        bb_width = bb_width_raw / 100.0 if bb_width_raw > 1 else bb_width_raw
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+
+        if strategy == "momentum":
+            return close > sma20 and sma20 > sma50 and rsi >= 55 and adx >= 22 and macd > macd_signal
+        if strategy == "breakout":
+            return close > sma20 and bb_width <= 0.035 and volume_ratio >= 1.1 and adx >= 18
+        if strategy == "swing":
+            return close > sma50 and sma50 >= sma200 and 40 <= rsi <= 65 and adx >= 16
+        if strategy == "mean_revert":
+            return rsi <= 35 and adx <= 22
+        return False
+
+    @staticmethod
+    def _pick_best_strategy(backtest: Dict[str, Dict]) -> Tuple[str, Dict]:
+        best_name = "none"
+        best_score = -1e9
+        best_info = {"trades": 0, "wins": 0, "win_rate": 0.5, "avg_return": 0.0, "sum_return": 0.0}
+        for name, info in backtest.items():
+            trades = int(info.get("trades", 0))
+            win_rate = float(info.get("win_rate", 0.5))
+            avg_return = float(info.get("avg_return", 0.0))
+            confidence_bonus = min(0.15, trades / 200.0)
+            score = (win_rate * 100.0) + (avg_return * 5.0) + (confidence_bonus * 100.0)
+            if trades < 5:
+                score -= 12.0
+            if score > best_score:
+                best_score = score
+                best_name = name
+                best_info = info
+        return best_name, best_info
+
+    @staticmethod
+    def _persist_strategy_backtest_rollup(cur, global_stats: Dict[str, Dict], period_start: str, period_end: str):
+        for strategy, agg in global_stats.items():
+            trades = int(agg["trades"])
+            wins = int(agg["wins"])
+            losses = max(0, trades - wins)
+            win_rate = (wins / trades) if trades > 0 else 0.0
+            avg_return = (float(agg["sum_return"]) / trades) if trades > 0 else 0.0
+            total_return = float(agg["sum_return"])
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO strategy_performance
+                (
+                    strategy_name, period_start, period_end, total_trades,
+                    winning_trades, losing_trades, win_rate, avg_return, total_return,
+                    max_drawdown, sharpe_ratio, profit_factor, best_market_regime,
+                    worst_market_regime, avg_holding_period, is_active, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    strategy,
+                    period_start,
+                    period_end,
+                    trades,
+                    wins,
+                    losses,
+                    win_rate,
+                    avg_return,
+                    total_return,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                ),
+            )

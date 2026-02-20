@@ -79,19 +79,24 @@ class ZerodhaClient:
             raise ZerodhaConfigError("Zerodha access token is missing. Authenticate first.")
         return self.kite.profile()
 
-    def fetch_quotes(self, symbols: List[str]) -> Dict[str, Dict]:
-        """Fetch quotes for NSE symbols."""
+    def fetch_quotes(self, symbols: List[str], batch_size: int = 100) -> Dict[str, Dict]:
+        """Fetch quotes for NSE symbols in batches to avoid oversized request URIs."""
         if not self.is_authenticated:
             raise ZerodhaConfigError("Zerodha access token is missing. Authenticate first.")
         if not symbols:
             return {}
 
-        instruments = [f"NSE:{s}" for s in symbols]
-        raw = self.kite.quote(instruments)
         out: Dict[str, Dict] = {}
-        for instrument, payload in raw.items():
-            symbol = instrument.split(":", 1)[-1]
-            out[symbol] = payload
+        unique_symbols = [s for s in dict.fromkeys(symbols) if s]
+
+        for i in range(0, len(unique_symbols), batch_size):
+            batch = unique_symbols[i : i + batch_size]
+            instruments = [f"NSE:{s}" for s in batch]
+            raw = self.kite.quote(instruments)
+            for instrument, payload in raw.items():
+                symbol = instrument.split(":", 1)[-1]
+                out[symbol] = payload
+
         return out
 
     def refresh_latest_metrics(self, symbols: List[str]) -> RefreshResult:

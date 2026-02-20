@@ -273,19 +273,20 @@ class PaperTradingEngine:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        try:
-            cursor.execute("""
-                SELECT * FROM trades_simulated
-                WHERE status = 'open'
-                ORDER BY entry_date DESC, entry_time DESC
-            """)
-        except sqlite3.OperationalError:
-            # Backward-compat fallback for older DBs missing entry_time.
-            cursor.execute("""
-                SELECT * FROM trades_simulated
-                WHERE status = 'open'
-                ORDER BY entry_date DESC
-            """)
+        # Backward-compatible query for legacy schemas.
+        cursor.execute("PRAGMA table_info(trades_simulated)")
+        cols = {row["name"] for row in cursor.fetchall()}
+
+        where_clause = "WHERE status = 'open'" if "status" in cols else ""
+        order_parts = []
+        if "entry_date" in cols:
+            order_parts.append("entry_date DESC")
+        if "entry_time" in cols:
+            order_parts.append("entry_time DESC")
+
+        order_clause = f"ORDER BY {', '.join(order_parts)}" if order_parts else ""
+        sql = f"SELECT * FROM trades_simulated {where_clause} {order_clause}"
+        cursor.execute(sql)
 
         trades = [dict(row) for row in cursor.fetchall()]
         conn.close()
@@ -308,9 +309,9 @@ class PaperTradingEngine:
         """
         open_trades = self._get_open_trades()
         
-        intraday_count = sum(1 for t in open_trades if t['mode'] == 'intraday')
-        swing_count = sum(1 for t in open_trades if t['mode'] == 'swing')
-        capital_deployed = sum(t['capital_used'] for t in open_trades)
+        intraday_count = sum(1 for t in open_trades if t.get('mode') == 'intraday')
+        swing_count = sum(1 for t in open_trades if t.get('mode') == 'swing')
+        capital_deployed = sum(float(t.get('capital_used') or 0.0) for t in open_trades)
         
         return {
             'total_positions': len(open_trades),

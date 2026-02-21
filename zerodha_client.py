@@ -5,7 +5,7 @@ Zerodha (Kite) client wrapper for data-only operations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 import logging
 import pandas as pd
@@ -261,6 +261,169 @@ class ZerodhaClient:
 
         return RefreshResult(inserted_or_updated=updated, failed=failed, failures=failures)
 
+    def scan_first4h_reversal_strategy(
+        self,
+        symbols: List[str],
+        trade_date: Optional[date] = None,
+        progress_cb: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> Dict:
+        """
+        4H first-candle range + 5m sweep/reversal strategy scanner.
+        Entry is on reversal bar close, with fixed 2:1 target.
+        """
+        if not self.is_authenticated:
+            raise ZerodhaConfigError("Zerodha access token is missing. Authenticate first.")
+        if not symbols:
+            return {"signals": [], "failed": 0, "failures": []}
+
+        trade_date = trade_date or date.today()
+        day_start = datetime.combine(trade_date, time(9, 15))
+        day_end = datetime.combine(trade_date, time(15, 30))
+
+        instruments = self.kite.instruments("NSE")
+        instrument_token_by_symbol, alias_to_tradingsymbol = self._build_instrument_resolution_maps(instruments)
+
+        failures: List[Tuple[str, str]] = []
+        signals: List[Dict] = []
+        total = len(symbols)
+        done = 0
+
+        for raw_symbol in symbols:
+            symbol = self.normalize_symbol(raw_symbol)
+            status = "ok"
+            try:
+                token = instrument_token_by_symbol.get(symbol)
+                if not token:
+                    resolved_symbol = self._resolve_to_tradingsymbol(
+                        symbol,
+                        instrument_token_by_symbol,
+                        alias_to_tradingsymbol,
+                    )
+                    token = instrument_token_by_symbol.get(resolved_symbol) if resolved_symbol else None
+                if not token:
+                    raise ValueError("Instrument token not found")
+
+                candles = self.kite.historical_data(
+                    instrument_token=token,
+                    from_date=day_start,
+                    to_date=day_end,
+                    interval="5minute",
+                )
+                if not candles:
+                    raise ValueError("No 5-minute candles for selected day")
+
+                intraday_df = pd.DataFrame(candles)
+                signal = self._build_first4h_reversal_signal(
+                    intraday_df=intraday_df,
+                    symbol=symbol,
+                    trade_date=trade_date,
+                )
+                if signal:
+                    signals.append(signal)
+                    status = "signal"
+                else:
+                    status = "no_signal"
+            except Exception as exc:
+                failures.append((symbol or str(raw_symbol), str(exc)))
+                status = "failed"
+
+            done += 1
+            if progress_cb:
+                progress_cb(done, total, symbol or str(raw_symbol), status)
+
+        return {
+            "signals": signals,
+            "failed": len(failures),
+            "failures": failures,
+        }
+
+    @classmethod
+    def _build_first4h_reversal_signal(
+        cls,
+        intraday_df: pd.DataFrame,
+        symbol: str,
+        trade_date: date,
+    ) -> Optional[Dict]:
+        if intraday_df.empty:
+            return None
+
+        df = intraday_df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df[df["date"].notna()]
+            df = df.sort_values(by="date").reset_index(drop=True)
+        if df.empty or len(df) < 50:
+            return None
+
+        # First 4 hours from 09:15 on a 5-minute chart => 48 bars.
+        first_4h = df.head(48)
+        first_4h_high = cls._safe_float(first_4h["high"].max(), 0.0)
+        first_4h_low = cls._safe_float(first_4h["low"].min(), 0.0)
+        if first_4h_high <= 0 or first_4h_low <= 0 or first_4h_high <= first_4h_low:
+            return None
+
+        post = df.iloc[48:].copy()
+        if post.empty:
+            return None
+
+        for _, bar in post.iterrows():
+            o = cls._safe_float(bar.get("open"), 0.0)
+            h = cls._safe_float(bar.get("high"), 0.0)
+            l = cls._safe_float(bar.get("low"), 0.0)
+            c = cls._safe_float(bar.get("close"), 0.0)
+            t = bar.get("date")
+            trigger_time = str(t) if t is not None else ""
+
+            # Sweep above first-4H high then bearish reversal back below high -> SELL.
+            if h > first_4h_high and c < first_4h_high and c < o:
+                entry = c
+                stop_loss = max(h, first_4h_high)
+                risk = stop_loss - entry
+                if risk <= 0:
+                    continue
+                target = entry - (2.0 * risk)
+                return {
+                    "symbol": symbol,
+                    "strategy": "first4h_reversal",
+                    "side": "SELL",
+                    "setup": "High sweep -> bearish reversal",
+                    "entry": round(entry, 2),
+                    "stop_loss": round(stop_loss, 2),
+                    "target": round(target, 2),
+                    "rr_ratio": 2.0,
+                    "risk_per_share": round(risk, 2),
+                    "first_4h_high": round(first_4h_high, 2),
+                    "first_4h_low": round(first_4h_low, 2),
+                    "trigger_time": trigger_time,
+                    "trade_date": trade_date.isoformat(),
+                }
+
+            # Sweep below first-4H low then bullish reversal back above low -> BUY.
+            if l < first_4h_low and c > first_4h_low and c > o:
+                entry = c
+                stop_loss = min(l, first_4h_low)
+                risk = entry - stop_loss
+                if risk <= 0:
+                    continue
+                target = entry + (2.0 * risk)
+                return {
+                    "symbol": symbol,
+                    "strategy": "first4h_reversal",
+                    "side": "BUY",
+                    "setup": "Low sweep -> bullish reversal",
+                    "entry": round(entry, 2),
+                    "stop_loss": round(stop_loss, 2),
+                    "target": round(target, 2),
+                    "rr_ratio": 2.0,
+                    "risk_per_share": round(risk, 2),
+                    "first_4h_high": round(first_4h_high, 2),
+                    "first_4h_low": round(first_4h_low, 2),
+                    "trigger_time": trigger_time,
+                    "trade_date": trade_date.isoformat(),
+                }
+
+        return None
+
     def refresh_ltp_snapshot(
         self,
         symbols: List[str],
@@ -478,6 +641,7 @@ class ZerodhaClient:
             name: {"trades": 0, "wins": 0, "sum_return": 0.0}
             for name in strategy_rules.keys()
         }
+        timeframe_coverage: Dict[str, int] = {}
 
         instrument_token_by_symbol: Dict[str, int] = {}
         alias_to_tradingsymbol: Dict[str, str] = {}
@@ -523,31 +687,60 @@ class ZerodhaClient:
                     continue
 
                 try:
-                    candles = self.kite.historical_data(
-                        instrument_token=token,
-                        from_date=from_date,
-                        to_date=date.today(),
-                        interval="day",
-                    )
-                    if not candles:
-                        raise ValueError("No historical candles")
-                    hist_df = pd.DataFrame(candles)
-                    if hist_df.empty or len(hist_df) < 80:
-                        raise ValueError("Insufficient historical candles")
+                    interval_plan = [
+                        ("day", max(120, lookback_days), hold_days, 1.0),
+                        ("60minute", min(120, lookback_days), max(16, hold_days * 6), 0.8),
+                        ("15minute", min(60, lookback_days), max(24, hold_days * 12), 0.6),
+                    ]
+                    combined_backtest = {
+                        name: {"trades": 0, "wins": 0, "sum_return": 0.0}
+                        for name in strategy_rules.keys()
+                    }
+                    latest = None
+                    usable_intervals = 0
 
-                    ind_df = add_indicators(hist_df)
-                    if ind_df.empty or len(ind_df) < 80:
-                        raise ValueError("Indicator enrichment failed")
+                    for interval, lb_days, interval_hold, weight in interval_plan:
+                        try:
+                            interval_from = date.today() - timedelta(days=max(20, lb_days))
+                            candles = self.kite.historical_data(
+                                instrument_token=token,
+                                from_date=interval_from,
+                                to_date=date.today(),
+                                interval=interval,
+                            )
+                            if not candles:
+                                continue
+                            hist_df = pd.DataFrame(candles)
+                            if hist_df.empty or len(hist_df) < 80:
+                                continue
 
-                    backtest = self._backtest_strategies(ind_df, hold_days=hold_days)
-                    for s_name, s_data in backtest.items():
+                            ind_df = add_indicators(hist_df)
+                            if ind_df.empty or len(ind_df) < 80:
+                                continue
+
+                            backtest_tf = self._backtest_strategies(ind_df, hold_days=interval_hold)
+                            for s_name, s_data in backtest_tf.items():
+                                combined_backtest[s_name]["trades"] += int(s_data["trades"] * weight)
+                                combined_backtest[s_name]["wins"] += int(s_data["wins"] * weight)
+                                combined_backtest[s_name]["sum_return"] += float(s_data["sum_return"] * weight)
+
+                            timeframe_coverage[interval] = timeframe_coverage.get(interval, 0) + 1
+                            usable_intervals += 1
+                            if interval == "day" or latest is None:
+                                latest = ind_df.iloc[-1]
+                        except Exception:
+                            continue
+
+                    if latest is None or usable_intervals == 0:
+                        raise ValueError("Insufficient historical candles across selected intervals")
+
+                    for s_name, s_data in combined_backtest.items():
                         global_stats[s_name]["trades"] += int(s_data["trades"])
                         global_stats[s_name]["wins"] += int(s_data["wins"])
                         global_stats[s_name]["sum_return"] += float(s_data["sum_return"])
 
-                    best_strategy, best_info = self._pick_best_strategy(backtest)
+                    best_strategy, best_info = self._pick_best_strategy(combined_backtest)
 
-                    latest = ind_df.iloc[-1]
                     row_snapshot = self._latest_metric_snapshot(cur, symbol)
                     if not row_snapshot:
                         raise ValueError("No latest metric row found. Run Refresh Metrics first.")
@@ -647,6 +840,7 @@ class ZerodhaClient:
             "failed_symbols": failed_symbols,
             "failures": failures,
             "strategy_distribution": strategy_distribution,
+            "timeframe_coverage": timeframe_coverage,
         }
 
     @staticmethod
@@ -1003,6 +1197,8 @@ class ZerodhaClient:
             name: {"trades": 0, "wins": 0, "sum_return": 0.0}
             for name in rules.keys()
         }
+        daily_once_strategies = {"opening_range_breakout"}
+        traded_days: Dict[str, set] = {name: set() for name in rules.keys()}
         if ind_df.empty or len(ind_df) <= hold_days + 60:
             return {k: {"trades": 0, "wins": 0, "win_rate": 0.5, "avg_return": 0.0, "sum_return": 0.0} for k in stats}
 
@@ -1011,8 +1207,12 @@ class ZerodhaClient:
             entry = self._safe_float(row.get("close"), 0.0)
             if entry <= 0:
                 continue
+            row_day = pd.to_datetime(row.get("date"), errors="coerce")
+            day_key = str(row_day.date()) if pd.notna(row_day) else f"idx_{i}"
 
             for strat in stats.keys():
+                if strat in daily_once_strategies and day_key in traded_days.get(strat, set()):
+                    continue
                 if self._strategy_signal(row, strat):
                     ret_pct = self._simulate_trade_return(
                         ind_df=ind_df,
@@ -1024,6 +1224,8 @@ class ZerodhaClient:
                     stats[strat]["sum_return"] += ret_pct
                     if ret_pct > 0:
                         stats[strat]["wins"] += 1
+                    if strat in daily_once_strategies:
+                        traded_days[strat].add(day_key)
 
         out = {}
         for strat, agg in stats.items():
@@ -1099,15 +1301,26 @@ class ZerodhaClient:
             "breakout": 0.12,
             "volatility_squeeze": 0.12,
             "range_breakout": 0.12,
+            "donchian_breakout": 0.12,
+            "volatility_expansion": 0.12,
+            "opening_range_breakout": 0.12,
+            "narrow_cpr_breakout": 0.12,
+            "volume_breakout_consolidation": 0.12,
             "momentum": 0.10,
             "rsi_momentum": 0.10,
             "adx_trend_follow": 0.10,
+            "trend_continuation": 0.10,
+            "rvol_momentum": 0.10,
             "swing": 0.08,
             "trend_pullback": 0.08,
             "ema_crossover": 0.08,
+            "breakout_retest": 0.08,
+            "ema9_21_pullback": 0.08,
+            "vwap_pullback": 0.08,
             "mean_revert": 0.09,
             "bollinger_revert": 0.09,
             "macd_reversal": 0.09,
+            "prev_day_hl_break": 0.09,
         }
         trading_cost = trading_cost_by_strategy.get(strategy, 0.10)
         return gross_ret - trading_cost
@@ -1126,6 +1339,13 @@ class ZerodhaClient:
         Add new strategies here; backtest loop picks them up automatically.
         """
         return {
+            "opening_range_breakout": ZerodhaClient._rule_opening_range_breakout,
+            "vwap_pullback": ZerodhaClient._rule_vwap_pullback,
+            "narrow_cpr_breakout": ZerodhaClient._rule_narrow_cpr_breakout,
+            "volume_breakout_consolidation": ZerodhaClient._rule_volume_breakout_consolidation,
+            "ema9_21_pullback": ZerodhaClient._rule_ema9_21_pullback,
+            "rvol_momentum": ZerodhaClient._rule_rvol_momentum,
+            "prev_day_hl_break": ZerodhaClient._rule_prev_day_hl_break,
             "momentum": ZerodhaClient._rule_momentum,
             "breakout": ZerodhaClient._rule_breakout,
             "swing": ZerodhaClient._rule_swing,
@@ -1138,7 +1358,96 @@ class ZerodhaClient:
             "rsi_momentum": ZerodhaClient._rule_rsi_momentum,
             "adx_trend_follow": ZerodhaClient._rule_adx_trend_follow,
             "bollinger_revert": ZerodhaClient._rule_bollinger_revert,
+            "donchian_breakout": ZerodhaClient._rule_donchian_breakout,
+            "breakout_retest": ZerodhaClient._rule_breakout_retest,
+            "trend_continuation": ZerodhaClient._rule_trend_continuation,
+            "volatility_expansion": ZerodhaClient._rule_volatility_expansion,
         }
+
+    @classmethod
+    def _rule_opening_range_breakout(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        or_high = cls._safe_float(row.get("OR_15_High"), 0.0)
+        or_low = cls._safe_float(row.get("OR_15_Low"), 0.0)
+        bars_from_open = cls._safe_float(row.get("Bars_From_Open"), 999.0)
+        if close <= 0 or or_high <= 0 or or_low <= 0:
+            return False
+        if bars_from_open <= 3:
+            return False
+        return close > or_high or close < or_low
+
+    @classmethod
+    def _rule_vwap_pullback(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        open_px = cls._safe_float(row.get("open"), close)
+        low = cls._safe_float(row.get("low"), close)
+        high = cls._safe_float(row.get("high"), close)
+        vwap = cls._safe_float(row.get("VWAP"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        if close <= 0 or vwap <= 0:
+            return False
+        long_setup = close > vwap and low <= vwap and close > open_px and adx >= 15
+        short_setup = close < vwap and high >= vwap and close < open_px and adx >= 15
+        return long_setup or short_setup
+
+    @classmethod
+    def _rule_narrow_cpr_breakout(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        cpr_high = cls._safe_float(row.get("CPR_High"), 0.0)
+        cpr_low = cls._safe_float(row.get("CPR_Low"), 0.0)
+        narrow = bool(row.get("Narrow_CPR", False))
+        if close <= 0 or cpr_high <= 0 or cpr_low <= 0 or not narrow:
+            return False
+        return close > cpr_high or close < cpr_low
+
+    @classmethod
+    def _rule_volume_breakout_consolidation(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        cons_high = cls._safe_float(row.get("Consolidation_High"), 0.0)
+        cons_low = cls._safe_float(row.get("Consolidation_Low"), 0.0)
+        tight = bool(row.get("Consolidation_Tight", False))
+        rvol = cls._safe_float(row.get("RVOL"), cls._safe_float(row.get("Volume_Ratio"), 1.0))
+        if close <= 0 or cons_high <= 0 or cons_low <= 0 or not tight:
+            return False
+        breakout_up = close > cons_high and rvol >= 2.0
+        breakout_down = close < cons_low and rvol >= 2.0
+        return breakout_up or breakout_down
+
+    @classmethod
+    def _rule_ema9_21_pullback(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        open_px = cls._safe_float(row.get("open"), close)
+        low = cls._safe_float(row.get("low"), close)
+        high = cls._safe_float(row.get("high"), close)
+        ema9 = cls._safe_float(row.get("EMA_9"), close)
+        ema21 = cls._safe_float(row.get("EMA_21"), close)
+        if close <= 0:
+            return False
+        long_setup = ema9 > ema21 and low <= max(ema9, ema21) and close > open_px
+        short_setup = ema9 < ema21 and high >= min(ema9, ema21) and close < open_px
+        return long_setup or short_setup
+
+    @classmethod
+    def _rule_rvol_momentum(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        rvol = cls._safe_float(row.get("RVOL"), cls._safe_float(row.get("Volume_Ratio"), 1.0))
+        gap_pct = cls._safe_float(row.get("Gap_Pct"), 0.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        ema9 = cls._safe_float(row.get("EMA_9"), close)
+        if close <= 0:
+            return False
+        strong_up = rvol > 2.0 and (gap_pct > 0.5 or close > ema9) and adx >= 18
+        strong_down = rvol > 2.0 and (gap_pct < -0.5 or close < ema9) and adx >= 18
+        return strong_up or strong_down
+
+    @classmethod
+    def _rule_prev_day_hl_break(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        prev_high = cls._safe_float(row.get("Prev_Day_High"), 0.0)
+        prev_low = cls._safe_float(row.get("Prev_Day_Low"), 0.0)
+        if close <= 0 or prev_high <= 0 or prev_low <= 0:
+            return False
+        return close > prev_high or close < prev_low
 
     @classmethod
     def _rule_momentum(cls, row) -> bool:
@@ -1246,6 +1555,52 @@ class ZerodhaClient:
         rsi = cls._safe_float(row.get("RSI"), 50.0)
         adx = cls._safe_float(row.get("ADX"), 20.0)
         return close <= bb_lower * 1.01 and rsi <= 35 and adx <= 22
+
+    @classmethod
+    def _rule_donchian_breakout(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        high = cls._safe_float(row.get("high"), close)
+        low = cls._safe_float(row.get("low"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        atr = cls._safe_float(row.get("ATR"), 0.0)
+        if close <= 0:
+            return False
+        range_pct = ((high - low) / close) * 100.0 if close > 0 else 0.0
+        atr_pct = (atr / close) * 100.0 if close > 0 else 0.0
+        return adx >= 20 and volume_ratio >= 1.15 and range_pct >= 1.2 and atr_pct >= 1.0
+
+    @classmethod
+    def _rule_breakout_retest(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        sma20 = cls._safe_float(row.get("SMA_20"), close)
+        ema21 = cls._safe_float(row.get("EMA_21"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        pullback_ok = abs(close - sma20) / close <= 0.015 if close > 0 else False
+        return close >= ema21 and pullback_ok and adx >= 18 and 45 <= rsi <= 65 and volume_ratio >= 1.0
+
+    @classmethod
+    def _rule_trend_continuation(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        ema9 = cls._safe_float(row.get("EMA_9"), close)
+        ema21 = cls._safe_float(row.get("EMA_21"), close)
+        sma50 = cls._safe_float(row.get("SMA_50"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        return ema9 >= ema21 >= sma50 and close >= ema9 and adx >= 22 and 52 <= rsi <= 72
+
+    @classmethod
+    def _rule_volatility_expansion(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        bb_width_raw = cls._safe_float(row.get("BB_Width"), 0.0)
+        bb_width = bb_width_raw / 100.0 if bb_width_raw > 1 else bb_width_raw
+        atr = cls._safe_float(row.get("ATR"), 0.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        atr_pct = (atr / close) * 100.0 if close > 0 else 0.0
+        return bb_width >= 0.02 and atr_pct >= 1.1 and adx >= 18 and volume_ratio >= 1.1
 
     @staticmethod
     def _pick_best_strategy(backtest: Dict[str, Dict]) -> Tuple[str, Dict]:

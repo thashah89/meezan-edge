@@ -82,6 +82,7 @@ OPERATION_VERSIONS = {
     "refresh_metrics": "1.3.0",
     "backtest_ai_boost": "1.2.0",
     "potential_stock_list": "1.0.0",
+    "first4h_reversal_scan": "1.0.0",
 }
 
 
@@ -993,6 +994,20 @@ with tab_market:
                         hold_days=5,
                         progress_cb=_on_backtest_progress,
                     )
+                    progress_bar.progress(0.92, text="Running 4H first-candle reversal strategy...")
+                    try:
+                        scan_result = z_client.scan_first4h_reversal_strategy(
+                            symbols=filtered_symbols,
+                            trade_date=date.today(),
+                        )
+                        st.session_state["first4h_reversal_scan_result"] = scan_result
+                        _mark_operation_run("first4h_reversal_scan")
+                    except Exception as scan_exc:
+                        st.session_state["first4h_reversal_scan_result"] = {
+                            "signals": [],
+                            "failed": 0,
+                            "failures": [("scan", str(scan_exc))],
+                        }
                     progress_bar.progress(1.0, text="Backtest complete.")
                     st.success(
                         f"Backtest + AI calibration updated {bt_result['updated_symbols']} symbols"
@@ -1004,6 +1019,11 @@ with tab_market:
                             [f"{k}: {v}" for k, v in sorted(bt_result["strategy_distribution"].items())]
                         )
                         st.caption(f"Strategy distribution: {dist}")
+                    if bt_result.get("timeframe_coverage"):
+                        tf_cov = ", ".join(
+                            [f"{k}: {v}" for k, v in sorted(bt_result["timeframe_coverage"].items())]
+                        )
+                        st.caption(f"Timeframe coverage (symbols with usable data): {tf_cov}")
                     st.rerun()
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
@@ -1207,6 +1227,38 @@ with tab_market:
                 by=["opportunity_score", "win_probability", "expected_return"],
                 ascending=[False, False, False],
             ).head(30)
+
+            # Merge 4H first-candle reversal signals generated during backtest.
+            scan_state = st.session_state.get("first4h_reversal_scan_result") or {}
+            scan_signals = scan_state.get("signals", []) if isinstance(scan_state, dict) else []
+            if scan_signals:
+                scan_df = pd.DataFrame(scan_signals).copy()
+                if not scan_df.empty and "symbol" in scan_df.columns:
+                    scan_df["symbol"] = scan_df["symbol"].astype(str).str.upper().str.strip()
+                    entry_s = pd.to_numeric(scan_df.get("entry", 0), errors="coerce").fillna(0.0)
+                    target_s = pd.to_numeric(scan_df.get("target", 0), errors="coerce").fillna(0.0)
+                    expected_pct = np.where(
+                        entry_s > 0,
+                        ((target_s - entry_s) / entry_s) * 100.0,
+                        0.0,
+                    )
+                    scan_rows = pd.DataFrame(
+                        {
+                            "symbol": scan_df["symbol"],
+                            "Potential Setup": "4H Reversal",
+                            "opportunity_score": 90.0,
+                            "strategy_fit": "first4h_reversal",
+                            "win_probability": 0.60,
+                            "expected_return": expected_pct,
+                            "rsi": np.nan,
+                            "adx": np.nan,
+                            "ltp": entry_s,
+                        }
+                    )
+                    potential_df = pd.concat([scan_rows, potential_df], ignore_index=True, sort=False)
+                    if "symbol" in potential_df.columns:
+                        potential_df["symbol"] = potential_df["symbol"].astype(str).str.upper().str.strip()
+                        potential_df = potential_df.drop_duplicates(subset=["symbol"], keep="first")
 
             if not potential_df.empty:
                 st.caption(

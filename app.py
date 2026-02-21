@@ -1455,6 +1455,18 @@ with tab_backtest:
                     & trades_df["outcome"].isin(selected_outcomes)
                 ].copy()
 
+                capital_default = float(st.session_state.get("total_capital", 500000))
+                starting_capital = st.number_input(
+                    "Starting Capital for Backtest P&L (INR)",
+                    min_value=10000.0,
+                    max_value=100000000.0,
+                    value=capital_default,
+                    step=10000.0,
+                    format="%.2f",
+                    help="Used to translate % returns into currency growth/loss.",
+                    key=f"bt_start_capital_{selected_run_id}",
+                )
+
                 total_trades = len(filtered_df)
                 wins = int((filtered_df["return_pct"] > 0).sum())
                 losses = int((filtered_df["return_pct"] < 0).sum())
@@ -1466,6 +1478,27 @@ with tab_backtest:
                 avg_win = float(filtered_df.loc[filtered_df["return_pct"] > 0, "return_pct"].mean()) if wins else 0.0
                 avg_loss = float(filtered_df.loc[filtered_df["return_pct"] < 0, "return_pct"].mean()) if losses else 0.0
                 expectancy = (win_rate * avg_win) + ((1.0 - win_rate) * avg_loss)
+                total_return_pct = float(filtered_df["return_pct"].sum()) if total_trades else 0.0
+
+                pnl_flat = starting_capital * (total_return_pct / 100.0)
+                ending_capital_flat = starting_capital + pnl_flat
+
+                growth_df = filtered_df.copy()
+                growth_df["order_date"] = pd.to_datetime(growth_df["entry_date"], errors="coerce")
+                growth_df["order_date"] = growth_df["order_date"].fillna(pd.Timestamp.min)
+                growth_df = growth_df.sort_values(by=["order_date", "symbol"], ascending=[True, True]).reset_index(drop=True)
+                running_capital = float(starting_capital)
+                per_trade_pnl = []
+                post_trade_equity = []
+                for ret in pd.to_numeric(growth_df["return_pct"], errors="coerce").fillna(0.0).tolist():
+                    trade_pnl = running_capital * (float(ret) / 100.0)
+                    running_capital += trade_pnl
+                    per_trade_pnl.append(trade_pnl)
+                    post_trade_equity.append(running_capital)
+                growth_df["trade_pnl_inr"] = per_trade_pnl
+                growth_df["equity_after_trade"] = post_trade_equity
+                ending_capital_compounded = running_capital
+                pnl_compounded = ending_capital_compounded - starting_capital
 
                 k1, k2, k3, k4, k5 = st.columns(5)
                 k1.metric("Trades", f"{total_trades}")
@@ -1473,6 +1506,11 @@ with tab_backtest:
                 k3.metric("Avg Return", f"{avg_return:.2f}%")
                 k4.metric("Expectancy", f"{expectancy:.2f}%")
                 k5.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor > 0 else "n/a")
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total P&L (₹, Flat)", f"₹{pnl_flat:,.0f}", f"{total_return_pct:.2f}%")
+                c2.metric("Ending Capital (₹, Flat)", f"₹{ending_capital_flat:,.0f}")
+                c3.metric("Ending Capital (₹, Compounded)", f"₹{ending_capital_compounded:,.0f}", f"₹{pnl_compounded:,.0f}")
 
                 symbol_summary = (
                     filtered_df.groupby("symbol", as_index=False)
@@ -1525,17 +1563,40 @@ with tab_backtest:
                         "created_at_ist": "Updated At (IST)",
                     }
                 )
+                if not growth_df.empty and "symbol" in growth_df.columns:
+                    growth_cols = growth_df[["symbol", "entry_date", "trade_pnl_inr", "equity_after_trade"]].copy()
+                    growth_cols["symbol"] = growth_cols["symbol"].astype(str)
+                    growth_cols["entry_date"] = growth_cols["entry_date"].astype(str)
+                    trade_table["Symbol"] = trade_table["Symbol"].astype(str)
+                    trade_table["Entry Date"] = trade_table["Entry Date"].astype(str)
+                    trade_table = trade_table.merge(
+                        growth_cols.rename(
+                            columns={
+                                "symbol": "Symbol",
+                                "entry_date": "Entry Date",
+                                "trade_pnl_inr": "Trade P&L (INR)",
+                                "equity_after_trade": "Equity After Trade (INR)",
+                            }
+                        ),
+                        on=["Symbol", "Entry Date"],
+                        how="left",
+                    )
                 for price_col in ["Entry", "Exit", "Stop", "Target"]:
                     if price_col in trade_table.columns:
                         trade_table[price_col] = pd.to_numeric(trade_table[price_col], errors="coerce").fillna(0.0).round(2)
                 if "Return %" in trade_table.columns:
                     trade_table["Return %"] = pd.to_numeric(trade_table["Return %"], errors="coerce").fillna(0.0).round(2)
+                for inr_col in ["Trade P&L (INR)", "Equity After Trade (INR)"]:
+                    if inr_col in trade_table.columns:
+                        trade_table[inr_col] = pd.to_numeric(trade_table[inr_col], errors="coerce").fillna(0.0).round(2)
                 for missing_col, default_val in {
                     "Reco Bias": "neutral",
                     "Reco Score": 0.0,
                     "Reco Hit": 0.5,
                     "Reco N": 0,
                     "Reco Source": "none",
+                    "Trade P&L (INR)": 0.0,
+                    "Equity After Trade (INR)": starting_capital,
                 }.items():
                     if missing_col not in trade_table.columns:
                         trade_table[missing_col] = default_val
@@ -1553,6 +1614,8 @@ with tab_backtest:
                             "Stop",
                             "Target",
                             "Return %",
+                            "Trade P&L (INR)",
+                            "Equity After Trade (INR)",
                             "Outcome",
                             "Reco Bias",
                             "Reco Score",

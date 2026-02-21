@@ -326,39 +326,14 @@ def score_all_stocks(metrics_list: List[Dict], market_sentiment: Dict = None) ->
 
 def determine_strategy_fit(metrics: Dict) -> str:
     """
-    Determine which trading strategy best fits this stock's profile.
-    
-    Returns: "momentum" | "breakout" | "swing" | "mean_revert" | "none"
+    Single-strategy mode:
+    Focus only on VWAP pullback setup and classify others as "none".
     """
     rsi = _safe_float(metrics.get('rsi', 50), 50.0)
     adx = _safe_float(metrics.get('adx', 0), 0.0)
-    bb_width = _safe_float(metrics.get('bb_width', 0), 0.0)
-    volume_ratio = _safe_float(metrics.get('volume_ratio', 1.0), 1.0)
     trend_score = _safe_float(metrics.get('trend_score', 0), 0.0)
-    
-    # bb_width may be represented as ratio (0.02) or percent (2.0).
-    bb_width_norm = (bb_width / 100.0) if bb_width > 1 else bb_width
-    
-    # Momentum: Strong trend + RSI 55-70 + ADX 30+
-    if trend_score >= 65 and 52 <= rsi <= 72 and adx >= 22:
-        return 'momentum'
-    
-    # Breakout: Squeeze + volume surge + ADX rising
-    if bb_width_norm < 0.02 and volume_ratio >= 1.2 and 18 <= adx <= 38:
-        return 'breakout'
-    
-    # Swing: Uptrend + pullback + moderate ADX
-    if trend_score >= 55 and 38 <= rsi <= 62 and 16 <= adx <= 42:
-        return 'swing'
-    
-    # Mean Reversion: Oversold + low ADX
-    if rsi <= 35 and adx < 20:
-        return 'mean_revert'
-    
-    # Fallback to avoid excessive "none" for otherwise tradable setups.
-    if trend_score >= 50:
-        return 'swing'
-    
+    if trend_score >= 50 and 40 <= rsi <= 65 and adx >= 15:
+        return 'vwap_pullback'
     return 'none'
 
 

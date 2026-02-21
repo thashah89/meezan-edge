@@ -1375,6 +1375,7 @@ with tab_market:
 with tab_backtest:
     st.markdown("<h1 class='main-header'>Backtest Review</h1>", unsafe_allow_html=True)
     st.markdown("**Detailed trade-level analysis for strategy validation and improvement**")
+    st.caption("Single-strategy mode active: `vwap_pullback`")
     st.markdown("---")
 
     try:
@@ -1445,6 +1446,45 @@ with tab_backtest:
                 trades_df["return_pct"] = pd.to_numeric(trades_df["return_pct"], errors="coerce").fillna(0.0)
                 trades_df["holding_bars"] = pd.to_numeric(trades_df["holding_bars"], errors="coerce").fillna(0).astype(int)
                 trades_df["created_at_ist"] = trades_df["created_at"].apply(_format_utc_to_ist)
+                reco_df = pd.DataFrame()
+                try:
+                    symbols_for_reco = sorted(trades_df["symbol"].dropna().astype(str).str.upper().unique().tolist())
+                    if symbols_for_reco:
+                        ph = ",".join(["?"] * len(symbols_for_reco))
+                        rconn = get_connection()
+                        rcur = rconn.cursor()
+                        rcur.execute(
+                            f"""
+                            SELECT m.symbol, m.reco_label, m.reco_score, m.reco_hit_rate, m.reco_sample_size, m.reco_source
+                            FROM stock_metrics m
+                            INNER JOIN (
+                                SELECT symbol, MAX(date) AS max_date
+                                FROM stock_metrics
+                                GROUP BY symbol
+                            ) latest ON latest.symbol = m.symbol AND latest.max_date = m.date
+                            WHERE m.symbol IN ({ph})
+                            """,
+                            symbols_for_reco,
+                        )
+                        reco_rows = rcur.fetchall()
+                        rconn.close()
+                        if reco_rows:
+                            reco_df = pd.DataFrame([dict(r) for r in reco_rows])
+                except Exception:
+                    reco_df = pd.DataFrame()
+                if not reco_df.empty:
+                    reco_df["symbol"] = reco_df["symbol"].astype(str).str.upper()
+                    trades_df["symbol"] = trades_df["symbol"].astype(str).str.upper()
+                    trades_df = trades_df.merge(reco_df, on="symbol", how="left")
+                for col_name, default_val in {
+                    "reco_label": "neutral",
+                    "reco_score": 0.0,
+                    "reco_hit_rate": 0.5,
+                    "reco_sample_size": 0,
+                    "reco_source": "none",
+                }.items():
+                    if col_name not in trades_df.columns:
+                        trades_df[col_name] = default_val
 
                 strategy_options = sorted(trades_df["strategy_name"].dropna().astype(str).unique().tolist())
                 timeframe_options = sorted(trades_df["timeframe"].dropna().astype(str).unique().tolist())
@@ -1514,6 +1554,9 @@ with tab_backtest:
                             win_rate=("return_pct", lambda s: float((s > 0).mean())),
                             avg_return=("return_pct", "mean"),
                             total_return=("return_pct", "sum"),
+                            reco_hit_rate=("reco_hit_rate", "max"),
+                            reco_score=("reco_score", "max"),
+                            reco_label=("reco_label", "first"),
                         )
                         .sort_values(by=["total_return", "avg_return"], ascending=[False, False])
                         .head(30)
@@ -1524,6 +1567,9 @@ with tab_backtest:
                             "win_rate": "Win Rate",
                             "avg_return": "Avg Return %",
                             "total_return": "Total Return %",
+                            "reco_hit_rate": "Reco Hit",
+                            "reco_score": "Reco Score",
+                            "reco_label": "Reco Bias",
                         }
                     )
                     st.markdown("#### Top Symbols")
@@ -1544,6 +1590,11 @@ with tab_backtest:
                         "target_price": "Target",
                         "return_pct": "Return %",
                         "outcome": "Outcome",
+                        "reco_label": "Reco Bias",
+                        "reco_score": "Reco Score",
+                        "reco_hit_rate": "Reco Hit",
+                        "reco_sample_size": "Reco N",
+                        "reco_source": "Reco Source",
                         "created_at_ist": "Updated At (IST)",
                     }
                 )
@@ -1552,6 +1603,15 @@ with tab_backtest:
                         trade_table[price_col] = pd.to_numeric(trade_table[price_col], errors="coerce").fillna(0.0).round(2)
                 if "Return %" in trade_table.columns:
                     trade_table["Return %"] = pd.to_numeric(trade_table["Return %"], errors="coerce").fillna(0.0).round(2)
+                for missing_col, default_val in {
+                    "Reco Bias": "neutral",
+                    "Reco Score": 0.0,
+                    "Reco Hit": 0.5,
+                    "Reco N": 0,
+                    "Reco Source": "none",
+                }.items():
+                    if missing_col not in trade_table.columns:
+                        trade_table[missing_col] = default_val
 
                 st.dataframe(
                     trade_table[
@@ -1568,6 +1628,11 @@ with tab_backtest:
                             "Target",
                             "Return %",
                             "Outcome",
+                            "Reco Bias",
+                            "Reco Score",
+                            "Reco Hit",
+                            "Reco N",
+                            "Reco Source",
                             "Updated At (IST)",
                         ]
                     ],

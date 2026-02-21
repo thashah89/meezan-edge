@@ -73,6 +73,11 @@ TABLES = {
             expected_return REAL,
             strategy_fit TEXT,
             confidence REAL,
+            reco_score REAL,
+            reco_hit_rate REAL,
+            reco_sample_size INTEGER,
+            reco_label TEXT,
+            reco_source TEXT,
             -- Metadata
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (symbol) REFERENCES stocks_master(symbol),
@@ -376,6 +381,11 @@ def _run_compat_migrations(cursor):
         "expected_return": "REAL",
         "strategy_fit": "TEXT",
         "confidence": "REAL",
+        "reco_score": "REAL",
+        "reco_hit_rate": "REAL",
+        "reco_sample_size": "INTEGER",
+        "reco_label": "TEXT",
+        "reco_source": "TEXT",
         "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
     })
 

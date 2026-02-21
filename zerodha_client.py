@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 import pandas as pd
 import numpy as np
+import requests
 
 try:
     from kiteconnect import KiteConnect
@@ -39,6 +40,7 @@ class RefreshResult:
 
 class ZerodhaClient:
     """Small data client for Kite APIs. Real order APIs are intentionally not exposed."""
+    PRIMARY_STRATEGY = "vwap_pullback"
 
     def __init__(self, api_key: str, api_secret: str, access_token: Optional[str] = None):
         self.api_key = (api_key or "").strip()
@@ -57,6 +59,7 @@ class ZerodhaClient:
         if self.access_token:
             self.kite.set_access_token(self.access_token)
         self.predictor = MLPredictor()
+        self._reco_cache: Dict[str, Dict[str, Any]] = {}
 
     @property
     def is_authenticated(self) -> bool:
@@ -195,7 +198,9 @@ class ZerodhaClient:
                             atr, bb_upper, bb_middle, bb_lower, bb_width, trend_score,
                             momentum_score, volatility_score, liquidity_score, opportunity_score,
                             volume_ratio, win_probability, expected_return,
-                            strategy_fit, confidence, updated_at
+                            strategy_fit, confidence,
+                            reco_score, reco_hit_rate, reco_sample_size, reco_label, reco_source,
+                            updated_at
                         )
                         VALUES
                         (
@@ -204,7 +209,9 @@ class ZerodhaClient:
                             ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, CURRENT_TIMESTAMP
+                            ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?,
+                            CURRENT_TIMESTAMP
                         )
                         """,
                         (
@@ -240,6 +247,11 @@ class ZerodhaClient:
                             row["expected_return"],
                             row["strategy_fit"],
                             row["confidence"],
+                            row.get("reco_score", 0.0),
+                            row.get("reco_hit_rate", 0.5),
+                            row.get("reco_sample_size", 0),
+                            row.get("reco_label", "neutral"),
+                            row.get("reco_source", "none"),
                         ),
                     )
                     updated += 1
@@ -767,17 +779,35 @@ class ZerodhaClient:
                         99.0,
                         max(45.0, 42.0 + (trade_count * 0.9) + (final_win * 30.0) + min(10.0, abs(final_profit) * 2.0)),
                     )
+                    reco_info = self._get_external_recommendation_signal(symbol)
+                    reco_score = float(reco_info.get("score", 0.0))
+                    reco_hit = float(reco_info.get("hit_rate", 0.5))
+                    reco_samples = int(reco_info.get("sample_size", 0))
+                    reco_prob = float(min(0.9, max(0.1, 0.5 + (reco_score * 0.22))))
+                    reco_weight = float(min(0.30, max(0.0, 0.08 + (reco_samples / 120.0))))
+                    final_win = ((1.0 - reco_weight) * final_win) + (reco_weight * reco_prob)
+                    hit_edge = max(-0.25, min(0.25, reco_hit - 0.5))
+                    final_profit = final_profit * (1.0 + (reco_score * hit_edge))
+                    final_confidence = min(99.0, max(40.0, final_confidence + (reco_weight * 12.0)))
 
                     if best_strategy == "none":
                         final_strategy = "none"
                         final_confidence = max(40.0, final_confidence - 12.0)
                     else:
                         final_strategy = best_strategy
+                        if reco_samples >= 8 and reco_hit >= 0.55 and reco_score <= -0.35:
+                            final_strategy = "none"
+                            final_confidence = max(40.0, final_confidence - 8.0)
 
                     enriched["win_probability"] = max(0.01, min(0.99, float(final_win)))
                     enriched["expected_return"] = float(final_profit)
                     enriched["confidence"] = float(final_confidence)
                     enriched["strategy_fit"] = final_strategy
+                    enriched["reco_score"] = reco_score
+                    enriched["reco_hit_rate"] = reco_hit
+                    enriched["reco_sample_size"] = reco_samples
+                    enriched["reco_label"] = str(reco_info.get("label", "neutral"))
+                    enriched["reco_source"] = str(reco_info.get("source", "yahoo_finance"))
                     enriched["opportunity_score"] = int(calculate_opportunity_score(enriched))
 
                     metric_date = row_snapshot.get("date") or today
@@ -790,7 +820,9 @@ class ZerodhaClient:
                             atr = ?, bb_upper = ?, bb_middle = ?, bb_lower = ?, bb_width = ?,
                             trend_score = ?, momentum_score = ?, volatility_score = ?, liquidity_score = ?,
                             volume_ratio = ?, strategy_fit = ?, win_probability = ?, expected_return = ?,
-                            confidence = ?, opportunity_score = ?, updated_at = CURRENT_TIMESTAMP
+                            confidence = ?, opportunity_score = ?,
+                            reco_score = ?, reco_hit_rate = ?, reco_sample_size = ?, reco_label = ?, reco_source = ?,
+                            updated_at = CURRENT_TIMESTAMP
                         WHERE symbol = ? AND date = ?
                         """,
                         (
@@ -818,6 +850,11 @@ class ZerodhaClient:
                             enriched["expected_return"],
                             enriched["confidence"],
                             enriched["opportunity_score"],
+                            enriched["reco_score"],
+                            enriched["reco_hit_rate"],
+                            enriched["reco_sample_size"],
+                            enriched["reco_label"],
+                            enriched["reco_source"],
                             symbol,
                             metric_date,
                         ),
@@ -942,14 +979,8 @@ class ZerodhaClient:
         expected_return = round(day_change_pct, 3)
         confidence = max(40.0, min(85.0, 55.0 + abs(day_change_pct * 4.0)))
 
-        if trend_score >= 70 and adx >= 25:
-            strategy_fit = "momentum"
-        elif bb_width < 0.02 and volume_ratio >= 1.1:
-            strategy_fit = "breakout"
-        elif trend_score >= 55:
-            strategy_fit = "swing"
-        elif rsi <= 35 and adx < 20:
-            strategy_fit = "mean_revert"
+        if (ltp >= bb_middle and adx >= 15) or (abs(day_change_pct) <= 1.8 and trend_score >= 50):
+            strategy_fit = ZerodhaClient.PRIMARY_STRATEGY
         else:
             strategy_fit = "none"
 
@@ -984,7 +1015,116 @@ class ZerodhaClient:
             "expected_return": expected_return,
             "strategy_fit": strategy_fit,
             "confidence": confidence,
+            "reco_score": 0.0,
+            "reco_hit_rate": 0.5,
+            "reco_sample_size": 0,
+            "reco_label": "neutral",
+            "reco_source": "none",
         }
+
+    def _get_external_recommendation_signal(self, symbol: str) -> Dict[str, Any]:
+        """
+        Pull analyst recommendation consensus and historical recommendation hit-rate
+        from Yahoo Finance and convert to normalized signal.
+        """
+        key = self.normalize_symbol(symbol)
+        if not key:
+            return {"score": 0.0, "hit_rate": 0.5, "sample_size": 0, "label": "neutral", "source": "none"}
+        cached = self._reco_cache.get(key)
+        if cached:
+            return cached
+
+        ticker = f"{key}.NS"
+        out = {
+            "score": 0.0,
+            "hit_rate": 0.5,
+            "sample_size": 0,
+            "label": "neutral",
+            "source": "yahoo_finance",
+        }
+        try:
+            summary_url = (
+                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+                "?modules=recommendationTrend,financialData,upgradeDowngradeHistory"
+            )
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(summary_url, timeout=4, headers=headers)
+            data = resp.json()
+            result = (((data or {}).get("quoteSummary") or {}).get("result") or [{}])[0]
+            trend = (((result.get("recommendationTrend") or {}).get("trend") or [{}])[0])
+            fin = result.get("financialData") or {}
+            updown = ((result.get("upgradeDowngradeHistory") or {}).get("history") or [])
+
+            strong_buy = float(trend.get("strongBuy") or 0)
+            buy = float(trend.get("buy") or 0)
+            hold = float(trend.get("hold") or 0)
+            sell = float(trend.get("sell") or 0)
+            strong_sell = float(trend.get("strongSell") or 0)
+            total_votes = strong_buy + buy + hold + sell + strong_sell
+            trend_score = ((strong_buy + buy) - (sell + strong_sell)) / total_votes if total_votes > 0 else 0.0
+
+            current_price = float(((fin.get("currentPrice") or {}).get("raw")) or 0.0)
+            target_mean = float(((fin.get("targetMeanPrice") or {}).get("raw")) or 0.0)
+            target_gap = ((target_mean - current_price) / current_price) if current_price > 0 and target_mean > 0 else 0.0
+            target_component = max(-1.0, min(1.0, target_gap / 0.20))
+
+            hist_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2y"
+            hresp = requests.get(hist_url, timeout=4, headers=headers)
+            hdata = hresp.json()
+            hres = (((hdata or {}).get("chart") or {}).get("result") or [{}])[0]
+            ts = hres.get("timestamp") or []
+            closes = ((((hres.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or [])
+            price_points = [(int(t), float(c)) for t, c in zip(ts, closes) if c is not None]
+            price_points.sort(key=lambda x: x[0])
+
+            successes = 0
+            considered = 0
+            if price_points and updown:
+                epochs = [p[0] for p in price_points]
+                for item in updown[:80]:
+                    epoch = int(item.get("epochGradeDate") or 0)
+                    action = str(item.get("action") or "").lower().strip()
+                    if epoch <= 0:
+                        continue
+                    direction = 0
+                    if action in {"up", "init", "main"}:
+                        direction = 1
+                    elif action in {"down"}:
+                        direction = -1
+                    if direction == 0:
+                        continue
+                    idx = np.searchsorted(epochs, epoch)
+                    if idx >= len(price_points) - 20:
+                        continue
+                    entry = price_points[idx][1]
+                    future = price_points[min(len(price_points) - 1, idx + 20)][1]
+                    if entry <= 0:
+                        continue
+                    considered += 1
+                    if (direction > 0 and future > entry) or (direction < 0 and future < entry):
+                        successes += 1
+            hit_rate = (successes / considered) if considered > 0 else 0.5
+
+            score = (0.7 * trend_score) + (0.3 * target_component)
+            score = max(-1.0, min(1.0, float(score)))
+            if score > 0.2:
+                label = "bullish"
+            elif score < -0.2:
+                label = "bearish"
+            else:
+                label = "neutral"
+            out = {
+                "score": score,
+                "hit_rate": float(hit_rate),
+                "sample_size": int(considered),
+                "label": label,
+                "source": "yahoo_finance",
+            }
+        except Exception:
+            pass
+
+        self._reco_cache[key] = out
+        return out
 
     def _enrich_row_with_history(self, instrument_token: int, row: Dict) -> Dict:
         """
@@ -1444,29 +1584,7 @@ class ZerodhaClient:
         Add new strategies here; backtest loop picks them up automatically.
         """
         return {
-            "opening_range_breakout": ZerodhaClient._rule_opening_range_breakout,
             "vwap_pullback": ZerodhaClient._rule_vwap_pullback,
-            "narrow_cpr_breakout": ZerodhaClient._rule_narrow_cpr_breakout,
-            "volume_breakout_consolidation": ZerodhaClient._rule_volume_breakout_consolidation,
-            "ema9_21_pullback": ZerodhaClient._rule_ema9_21_pullback,
-            "rvol_momentum": ZerodhaClient._rule_rvol_momentum,
-            "prev_day_hl_break": ZerodhaClient._rule_prev_day_hl_break,
-            "momentum": ZerodhaClient._rule_momentum,
-            "breakout": ZerodhaClient._rule_breakout,
-            "swing": ZerodhaClient._rule_swing,
-            "mean_revert": ZerodhaClient._rule_mean_revert,
-            "trend_pullback": ZerodhaClient._rule_trend_pullback,
-            "ema_crossover": ZerodhaClient._rule_ema_crossover,
-            "macd_reversal": ZerodhaClient._rule_macd_reversal,
-            "volatility_squeeze": ZerodhaClient._rule_volatility_squeeze,
-            "range_breakout": ZerodhaClient._rule_range_breakout,
-            "rsi_momentum": ZerodhaClient._rule_rsi_momentum,
-            "adx_trend_follow": ZerodhaClient._rule_adx_trend_follow,
-            "bollinger_revert": ZerodhaClient._rule_bollinger_revert,
-            "donchian_breakout": ZerodhaClient._rule_donchian_breakout,
-            "breakout_retest": ZerodhaClient._rule_breakout_retest,
-            "trend_continuation": ZerodhaClient._rule_trend_continuation,
-            "volatility_expansion": ZerodhaClient._rule_volatility_expansion,
         }
 
     @classmethod
@@ -1729,9 +1847,9 @@ class ZerodhaClient:
                 best_name = name
                 best_info = info
 
-        min_trades = 12
-        min_win_rate = 0.52
-        min_avg_return = 0.05
+        min_trades = 8
+        min_win_rate = 0.50
+        min_avg_return = 0.02
         if (
             int(best_info.get("trades", 0)) < min_trades
             or float(best_info.get("win_rate", 0.0)) < min_win_rate

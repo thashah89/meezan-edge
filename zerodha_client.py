@@ -1554,6 +1554,16 @@ class ZerodhaClient:
             "bollinger_revert": 0.09,
             "macd_reversal": 0.09,
             "prev_day_hl_break": 0.09,
+            "ai_multi_timeframe_trend": 0.08,
+            "ai_mean_reversion_pro": 0.09,
+            "ai_breakout_master": 0.11,
+            "ai_momentum_surge": 0.10,
+            "ai_volatility_breakout": 0.11,
+            "ai_triple_screen": 0.09,
+            "ai_divergence_hunter": 0.09,
+            "ai_channel_breakout": 0.11,
+            "ai_fibonacci_retracement": 0.08,
+            "ai_smart_grid": 0.08,
         }
         trading_cost = trading_cost_by_strategy.get(strategy, 0.10)
         net_return = gross_ret - trading_cost
@@ -1591,6 +1601,16 @@ class ZerodhaClient:
         Add new strategies here; backtest loop picks them up automatically.
         """
         return {
+            "ai_multi_timeframe_trend": ZerodhaClient._rule_ai_multi_timeframe_trend,
+            "ai_mean_reversion_pro": ZerodhaClient._rule_ai_mean_reversion_pro,
+            "ai_breakout_master": ZerodhaClient._rule_ai_breakout_master,
+            "ai_momentum_surge": ZerodhaClient._rule_ai_momentum_surge,
+            "ai_volatility_breakout": ZerodhaClient._rule_ai_volatility_breakout,
+            "ai_triple_screen": ZerodhaClient._rule_ai_triple_screen,
+            "ai_divergence_hunter": ZerodhaClient._rule_ai_divergence_hunter,
+            "ai_channel_breakout": ZerodhaClient._rule_ai_channel_breakout,
+            "ai_fibonacci_retracement": ZerodhaClient._rule_ai_fibonacci_retracement,
+            "ai_smart_grid": ZerodhaClient._rule_ai_smart_grid,
             "vwap_pullback": ZerodhaClient._rule_vwap_pullback,
         }
 
@@ -1678,6 +1698,131 @@ class ZerodhaClient:
         if close <= 0 or prev_high <= 0 or prev_low <= 0:
             return False
         return close > prev_high or close < prev_low
+
+    @classmethod
+    def _rule_ai_multi_timeframe_trend(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        sma20 = cls._safe_float(row.get("SMA_20"), close)
+        sma50 = cls._safe_float(row.get("SMA_50"), close)
+        sma200 = cls._safe_float(row.get("SMA_200"), close)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        macd = cls._safe_float(row.get("MACD"), 0.0)
+        macd_signal = cls._safe_float(row.get("MACD_Signal"), 0.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        return (
+            close > sma20 > sma50 > sma200
+            and adx > 25
+            and 50 < rsi < 70
+            and macd > macd_signal
+            and volume_ratio > 1.0
+        )
+
+    @classmethod
+    def _rule_ai_mean_reversion_pro(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        will_r = cls._safe_float(row.get("Williams_R"), -50.0)
+        stoch_k = cls._safe_float(row.get("Stoch_K"), 50.0)
+        bb_lower = cls._safe_float(row.get("BB_Lower"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        sma200 = cls._safe_float(row.get("SMA_200"), close)
+        return (
+            close > 0
+            and rsi < 30
+            and will_r < -80
+            and stoch_k < 20
+            and close < bb_lower
+            and adx < 25
+            and close > sma200
+        )
+
+    @classmethod
+    def _rule_ai_breakout_master(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        high = cls._safe_float(row.get("high"), close)
+        bb_width = cls._safe_float(row.get("BB_Width"), 0.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        # Approximate squeeze threshold for row-level screening.
+        squeeze = bb_width <= 8.0
+        breakout = close > high * 0.997
+        return close > 0 and squeeze and breakout and volume_ratio > 1.5 and rsi > 60
+
+    @classmethod
+    def _rule_ai_momentum_surge(cls, row) -> bool:
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        macd_hist = cls._safe_float(row.get("MACD_Hist"), 0.0)
+        aroon_up = cls._safe_float(row.get("Aroon_Up"), 50.0)
+        close = cls._safe_float(row.get("close"), 0.0)
+        ema20 = cls._safe_float(row.get("EMA_20"), close)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        return (
+            60 < rsi < 80
+            and adx > 30
+            and macd_hist > 0
+            and aroon_up > 70
+            and close > ema20
+            and volume_ratio > 1.2
+        )
+
+    @classmethod
+    def _rule_ai_volatility_breakout(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        atr = cls._safe_float(row.get("ATR"), 0.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        keltner_upper = cls._safe_float(row.get("Keltner_Upper"), close)
+        volatility_regime = int(cls._safe_float(row.get("Volatility_Regime"), 2))
+        return close > 0 and volatility_regime == 1 and atr > 0 and close > keltner_upper and rsi > 55
+
+    @classmethod
+    def _rule_ai_triple_screen(cls, row) -> bool:
+        ema50 = cls._safe_float(row.get("EMA_50"), 0.0)
+        ema200 = cls._safe_float(row.get("EMA_200"), 0.0)
+        stoch_k = cls._safe_float(row.get("Stoch_K"), 50.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        close = cls._safe_float(row.get("close"), 0.0)
+        ema5 = cls._safe_float(row.get("EMA_5"), close)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        return ema50 > ema200 and stoch_k < 30 and rsi < 40 and close > ema5 and volume_ratio > 1.1
+
+    @classmethod
+    def _rule_ai_divergence_hunter(cls, row) -> bool:
+        # Approximated with oversold reversal context in row-level backtests.
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        macd_hist = cls._safe_float(row.get("MACD_Hist"), 0.0)
+        return rsi < 35 and macd_hist >= -0.05 and volume_ratio >= 1.0
+
+    @classmethod
+    def _rule_ai_channel_breakout(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        high = cls._safe_float(row.get("high"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        return close > 0 and close > high * 0.997 and adx > 20 and volume_ratio > 1.1
+
+    @classmethod
+    def _rule_ai_fibonacci_retracement(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        sma200 = cls._safe_float(row.get("SMA_200"), close)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        return close > sma200 and 40 <= rsi <= 60 and volume_ratio > 0.9
+
+    @classmethod
+    def _rule_ai_smart_grid(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        atr = cls._safe_float(row.get("ATR"), 0.0)
+        sma50 = cls._safe_float(row.get("SMA_50"), close)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        if close <= 0 or atr <= 0:
+            return False
+        grid_size = atr * 1.5
+        support_zone = (close % grid_size) < (0.2 * grid_size) if grid_size > 0 else False
+        return support_zone and 45 <= rsi <= 65 and volume_ratio > 0.8 and close > sma50
 
     @classmethod
     def _rule_momentum(cls, row) -> bool:

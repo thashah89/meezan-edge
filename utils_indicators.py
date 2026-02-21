@@ -18,8 +18,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['SMA_200'] = df['close'].rolling(200).mean()
     
     # EMAs
+    df['EMA_5'] = df['close'].ewm(span=5).mean()
     df['EMA_9'] = df['close'].ewm(span=9).mean()
+    df['EMA_10'] = df['close'].ewm(span=10).mean()
+    df['EMA_20'] = df['close'].ewm(span=20).mean()
     df['EMA_21'] = df['close'].ewm(span=21).mean()
+    df['EMA_50'] = df['close'].ewm(span=50).mean()
+    df['EMA_100'] = df['close'].ewm(span=100).mean()
+    df['EMA_200'] = df['close'].ewm(span=200).mean()
     
     # RSI
     delta = df['close'].diff()
@@ -33,6 +39,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ema26 = df['close'].ewm(span=26).mean()
     df['MACD'] = ema12 - ema26
     df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
     # ATR
     hl = df['high'] - df['low']
@@ -45,8 +52,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     sma20 = df['SMA_20']
     std20 = df['close'].rolling(20).std()
     df['BB_Upper'] = sma20 + (2 * std20)
+    df['BB_Middle'] = sma20
     df['BB_Lower'] = sma20 - (2 * std20)
     df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / sma20) * 100
+
+    # Keltner channels
+    df["Keltner_Middle"] = df["EMA_20"]
+    df["Keltner_Upper"] = df["Keltner_Middle"] + (2 * df["ATR"])
+    df["Keltner_Lower"] = df["Keltner_Middle"] - (2 * df["ATR"])
     
     # ADX
     df['ADX'] = calculate_adx(df)
@@ -55,6 +68,47 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Volume_SMA20'] = df['volume'].rolling(20).mean()
     df['Volume_Ratio'] = df['volume'] / df['Volume_SMA20']
     df['RVOL'] = df['Volume_Ratio']
+
+    # Stochastic, CCI, Williams %R
+    stoch_low = df["low"].rolling(14).min()
+    stoch_high = df["high"].rolling(14).max()
+    stoch_k_raw = 100 * ((df["close"] - stoch_low) / (stoch_high - stoch_low))
+    df["Stoch_K"] = stoch_k_raw.rolling(3).mean()
+    df["Stoch_D"] = df["Stoch_K"].rolling(3).mean()
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+    tp_sma = typical_price.rolling(20).mean()
+    tp_mad = typical_price.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean())
+    df["CCI"] = (typical_price - tp_sma) / (0.015 * tp_mad)
+
+    will_high = df["high"].rolling(14).max()
+    will_low = df["low"].rolling(14).min()
+    df["Williams_R"] = -100 * ((will_high - df["close"]) / (will_high - will_low))
+
+    # Aroon
+    aroon_period = 25
+    df["Aroon_Up"] = 100 * df["high"].rolling(aroon_period + 1).apply(lambda x: x.argmax() / aroon_period)
+    df["Aroon_Down"] = 100 * df["low"].rolling(aroon_period + 1).apply(lambda x: x.argmin() / aroon_period)
+
+    # Enhanced meta indicators
+    df["ATR_pct"] = np.where(df["close"] > 0, (df["ATR"] / df["close"]) * 100.0, np.nan)
+
+    ma_alignment = (
+        (df["close"] > df["SMA_20"]).astype(int) * 25
+        + (df["SMA_20"] > df["SMA_50"]).astype(int) * 25
+        + (df["SMA_50"] > df["SMA_200"]).astype(int) * 25
+        + (df["close"] > df["SMA_200"]).astype(int) * 25
+    )
+    adx_strength = np.minimum(df["ADX"] * 2.5, 100)
+    df["Trend_Strength"] = pd.concat([ma_alignment, adx_strength], axis=1).mean(axis=1)
+
+    low_vol_cut = df["ATR_pct"].rolling(100, min_periods=20).quantile(0.33)
+    med_vol_cut = df["ATR_pct"].rolling(100, min_periods=20).quantile(0.67)
+    df["Volatility_Regime"] = np.select(
+        [df["ATR_pct"] < low_vol_cut, df["ATR_pct"] < med_vol_cut],
+        [1, 2],
+        default=3,
+    )
 
     # Previous bar/day references
     df["Prev_Close"] = df["close"].shift(1)

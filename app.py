@@ -50,6 +50,7 @@ from paper_trader import PaperTradingEngine, get_performance_metrics
 from ml_trainer import MLTrainer, MLPredictor, auto_train_if_due
 from halal_scraper import scrape_halal_stocks
 from zerodha_client import ZerodhaClient, ZerodhaConfigError
+from news_intel_engine import NewsIntelEngine
 
 # Initialize
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +66,7 @@ if not st.session_state.get('db_initialized'):
 def get_engines():
     return {
         'intel': MarketIntelligenceEngine(),
+        'news': NewsIntelEngine(),
         'allocator': CapitalAllocator(),
         'selector': TradeSelector(),
         'trader': PaperTradingEngine(config.DB_PATH),
@@ -82,6 +84,7 @@ OPERATION_VERSIONS = {
     "refresh_metrics": "1.3.0",
     "backtest_ai_boost": "1.2.0",
     "potential_stock_list": "1.0.0",
+    "news_breakout_scan": "1.0.0",
 }
 
 
@@ -1304,6 +1307,74 @@ with tab_market:
         st.info("Run Refresh Metrics first. Potential stock list displays only after today's metrics are generated.")
 
     st.markdown("---")
+    st.subheader("📰 News Breakout Intelligence")
+    company_map = {}
+    try:
+        if not stocks_df.empty:
+            company_map = {
+                str(r.get("symbol", "")).upper(): str(r.get("company", ""))
+                for _, r in stocks_df.iterrows()
+                if str(r.get("symbol", "")).strip()
+            }
+    except Exception:
+        company_map = {}
+
+    news_scope_symbols = []
+    try:
+        if "potential_df" in locals() and isinstance(potential_df, pd.DataFrame) and not potential_df.empty:
+            news_scope_symbols = (
+                potential_df["symbol"].astype(str).str.upper().dropna().unique().tolist()
+            )
+        elif filtered_symbols:
+            news_scope_symbols = [str(s).upper() for s in filtered_symbols][:50]
+    except Exception:
+        news_scope_symbols = [str(s).upper() for s in filtered_symbols][:50] if filtered_symbols else []
+
+    if st.button("🧠 Scan News Catalysts", use_container_width=True):
+        if not news_scope_symbols:
+            st.warning("No symbols available for news scan. Load stocks and refresh metrics first.")
+        else:
+            with st.spinner(f"Analyzing recent news for {len(news_scope_symbols)} symbols..."):
+                rankings = engines["news"].rank_breakout_candidates(news_scope_symbols, company_map=company_map)
+                st.session_state["news_breakout_rankings"] = rankings
+                _mark_operation_run("news_breakout_scan")
+                st.success(f"News scan completed for {len(rankings)} symbols.")
+
+    cached_news = st.session_state.get("news_breakout_rankings") or []
+    if cached_news:
+        news_df = pd.DataFrame(cached_news)
+        if not news_df.empty:
+            news_table = pd.DataFrame(
+                {
+                    "Symbol": news_df.get("symbol", ""),
+                    "News Score": pd.to_numeric(news_df.get("news_breakout_score", 50.0), errors="coerce").fillna(50.0).round(1),
+                    "Bias": news_df.get("sentiment_bias", "neutral").astype(str).str.title(),
+                    "Confidence": pd.to_numeric(news_df.get("confidence", 0.0), errors="coerce").fillna(0.0).round(1),
+                    "News Items": pd.to_numeric(news_df.get("news_items", 0), errors="coerce").fillna(0).astype(int),
+                    "Catalysts": pd.to_numeric(news_df.get("catalyst_hits", 0), errors="coerce").fillna(0).astype(int),
+                }
+            ).sort_values(by=["News Score", "Confidence"], ascending=[False, False]).head(25)
+            st.dataframe(news_table, use_container_width=True, hide_index=True)
+
+            if st.checkbox("Show top headlines", value=False, key="show_news_headlines"):
+                for item in cached_news[:10]:
+                    sym = str(item.get("symbol", ""))
+                    headlines = item.get("top_headlines") or []
+                    if not headlines:
+                        continue
+                    st.markdown(f"**{sym}**")
+                    for h in headlines[:3]:
+                        title = str(h.get("title", "")).strip()
+                        source = str(h.get("source", "")).strip()
+                        link = str(h.get("link", "")).strip()
+                        if link:
+                            st.markdown(f"- [{title}]({link}) ({source})")
+                        else:
+                            st.markdown(f"- {title} ({source})")
+    else:
+        st.info("Run News Catalyst scan to include headline-driven breakout signals.")
+
+    st.markdown("---")
     st.subheader("🧪 Backtest Report")
     try:
         conn = get_connection()
@@ -1388,7 +1459,7 @@ with tab_market:
 with tab_backtest:
     st.markdown("<h1 class='main-header'>Backtest Review</h1>", unsafe_allow_html=True)
     st.markdown("**Detailed trade-level analysis for strategy validation and improvement**")
-    st.caption("Single-strategy mode active: `vwap_pullback`")
+    st.caption("Strategy-level drilldown mode")
     st.markdown("---")
 
     try:
@@ -1398,15 +1469,15 @@ with tab_backtest:
             """
             SELECT
                 run_id,
+                strategy_name,
                 COUNT(*) AS trades,
                 SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins,
                 AVG(return_pct) AS avg_return,
                 MAX(created_at) AS updated_at
             FROM backtest_trades
-            WHERE strategy_name = 'vwap_pullback'
-            GROUP BY run_id
-            ORDER BY MAX(created_at) DESC
-            LIMIT 20
+            GROUP BY run_id, strategy_name
+            ORDER BY MAX(created_at) DESC, strategy_name ASC
+            LIMIT 200
             """
         )
         run_rows = cursor.fetchall()
@@ -1421,9 +1492,12 @@ with tab_backtest:
             runs_df["trades"] = pd.to_numeric(runs_df["trades"], errors="coerce").fillna(0).astype(int)
             runs_df["win_rate"] = np.where(runs_df["trades"] > 0, runs_df["wins"] / runs_df["trades"], 0.0)
 
+            strategy_choices = sorted(runs_df["strategy_name"].astype(str).unique().tolist())
+            selected_strategy = st.selectbox("Strategy", strategy_choices, index=0)
+            filtered_runs = runs_df[runs_df["strategy_name"] == selected_strategy].copy()
             run_options = [
                 f"{row.run_id} | {row.updated_at_ist} | trades: {int(row.trades)} | win: {row.win_rate:.1%}"
-                for row in runs_df.itertuples(index=False)
+                for row in filtered_runs.itertuples(index=False)
             ]
             selected_run_label = st.selectbox("Backtest Run", run_options, index=0)
             selected_run_id = selected_run_label.split(" | ", 1)[0]
@@ -1446,10 +1520,10 @@ with tab_backtest:
                     created_at
                 FROM backtest_trades
                 WHERE run_id = ?
-                  AND strategy_name = 'vwap_pullback'
+                  AND strategy_name = ?
                 ORDER BY entry_date DESC, symbol ASC
                 """,
-                (selected_run_id,),
+                (selected_run_id, selected_strategy),
             )
             trade_rows = cursor.fetchall()
             conn.close()
@@ -1879,6 +1953,31 @@ with tab_portfolio:
             min_win_rate=0.50,
             min_avg_return=0.0,
         )
+        use_news_gate = st.checkbox(
+            "Use News Breakout Gate for execution",
+            value=True,
+            help="Require strong recent news catalysts before allowing execution.",
+            key="use_news_breakout_gate",
+        )
+        news_min_score = st.slider(
+            "Minimum News Score",
+            min_value=40,
+            max_value=85,
+            value=55,
+            step=1,
+            key="min_news_breakout_score",
+        )
+        news_rankings = st.session_state.get("news_breakout_rankings") or []
+        news_score_map = {}
+        for item in news_rankings:
+            try:
+                sym = str(item.get("symbol", "")).upper().strip()
+                score = float(item.get("news_breakout_score", 50.0))
+                if sym:
+                    news_score_map[sym] = score
+            except Exception:
+                continue
+
         execution_candidates = []
         for s in (scored or []):
             symbol = str(s.get("symbol", "")).upper().strip()
@@ -1886,6 +1985,7 @@ with tab_portfolio:
             winp = float(pd.to_numeric(s.get("win_probability", 0), errors="coerce") or 0.0)
             exret = float(pd.to_numeric(s.get("expected_return", 0), errors="coerce") or 0.0)
             fit = str(s.get("strategy_fit", "")).lower().strip()
+            news_score = float(news_score_map.get(symbol, 50.0))
             if (
                 symbol
                 and symbol in approved_symbols
@@ -1893,12 +1993,18 @@ with tab_portfolio:
                 and opp >= 65
                 and winp >= 0.52
                 and exret >= 0.0
+                and ((not use_news_gate) or (news_score >= float(news_min_score)))
             ):
+                s = dict(s)
+                s["news_breakout_score"] = news_score
                 execution_candidates.append(s)
         st.caption(
             f"Execution universe: {len(execution_candidates)} approved potential stocks "
-            f"(from {len(scored or [])} scored; approved symbols: {len(approved_symbols)})."
+            f"(from {len(scored or [])} scored; approved symbols: {len(approved_symbols)}"
+            f"{'; news-gated' if use_news_gate else '; news gate off'})."
         )
+        if use_news_gate and not news_score_map:
+            st.warning("News gate is ON but no cached news scan found. Run 'Scan News Catalysts' in Market tab.")
         if scored and not execution_candidates:
             st.warning(
                 "No stocks passed backtest-approved potential filter. "

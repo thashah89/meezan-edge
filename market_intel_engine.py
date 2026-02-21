@@ -293,18 +293,26 @@ def score_all_stocks(metrics_list: List[Dict], market_sentiment: Dict = None) ->
         List of dicts with scores, sorted by opportunity_score desc
     """
     scored = []
-    
+
+    if not metrics_list:
+        return scored
+
     for metrics in metrics_list:
-        opp_score = calculate_opportunity_score(metrics, market_sentiment)
-        
-        # Add score to metrics
-        enriched = metrics.copy()
-        enriched['opportunity_score'] = opp_score
-        
-        # Determine strategy fit
-        enriched['strategy_fit'] = determine_strategy_fit(metrics)
-        
-        scored.append(enriched)
+        # Handle sqlite.Row / mapping-like rows safely.
+        try:
+            metrics_dict = dict(metrics) if not isinstance(metrics, dict) else metrics
+        except Exception:
+            metrics_dict = {}
+
+        try:
+            opp_score = calculate_opportunity_score(metrics_dict, market_sentiment)
+            enriched = metrics_dict.copy()
+            enriched['opportunity_score'] = opp_score
+            enriched['strategy_fit'] = determine_strategy_fit(metrics_dict)
+            scored.append(enriched)
+        except Exception as exc:
+            symbol = metrics_dict.get('symbol', 'UNKNOWN')
+            log.warning("Skipping score for %s due to invalid metrics row: %s", symbol, exc)
     
     # Sort by opportunity score descending
     scored.sort(key=lambda x: x['opportunity_score'], reverse=True)
@@ -373,25 +381,25 @@ def apply_filters(scored_stocks: List[Dict], filters: Dict) -> List[Dict]:
     
     # Uptrend only
     if filters.get('uptrend_only'):
-        filtered = [s for s in filtered if s.get('trend_score', 0) >= 60]
+        filtered = [s for s in filtered if _safe_float(s.get('trend_score', 0), 0.0) >= 60]
     
     # Strong momentum
     if filters.get('strong_momentum'):
         filtered = [s for s in filtered if 
-                   s.get('adx', 0) >= 25 and s.get('rsi', 50) > 55]
+                   _safe_float(s.get('adx', 0), 0.0) >= 25 and _safe_float(s.get('rsi', 50), 50.0) > 55]
     
     # Breakout ready
     if filters.get('breakout_ready'):
         filtered = [s for s in filtered if
-                   s.get('bb_width', 1) < 0.02 and s.get('volume_ratio', 0) > 1.2]
+                   _safe_float(s.get('bb_width', 1), 1.0) < 0.02 and _safe_float(s.get('volume_ratio', 0), 0.0) > 1.2]
     
     # Oversold
     if filters.get('oversold'):
-        filtered = [s for s in filtered if s.get('rsi', 50) < 35]
+        filtered = [s for s in filtered if _safe_float(s.get('rsi', 50), 50.0) < 35]
     
     # High volume
     if filters.get('high_volume'):
-        filtered = [s for s in filtered if s.get('volume_ratio', 0) >= 1.5]
+        filtered = [s for s in filtered if _safe_float(s.get('volume_ratio', 0), 0.0) >= 1.5]
     
     # RSI range
     rsi_min = filters.get('rsi_min')
@@ -400,12 +408,12 @@ def apply_filters(scored_stocks: List[Dict], filters: Dict) -> List[Dict]:
         rsi_min = rsi_min if rsi_min is not None else 0
         rsi_max = rsi_max if rsi_max is not None else 100
         filtered = [s for s in filtered if
-                   rsi_min <= s.get('rsi', 50) <= rsi_max]
+                   rsi_min <= _safe_float(s.get('rsi', 50), 50.0) <= rsi_max]
     
     # ADX strength
     adx_min = filters.get('adx_min')
     if adx_min is not None:
-        filtered = [s for s in filtered if s.get('adx', 0) >= adx_min]
+        filtered = [s for s in filtered if _safe_float(s.get('adx', 0), 0.0) >= adx_min]
     
     # Strategy fit
     strategy_fit = filters.get('strategy_fit')
@@ -414,7 +422,7 @@ def apply_filters(scored_stocks: List[Dict], filters: Dict) -> List[Dict]:
     
     # Minimum opportunity score
     min_score = filters.get('min_opportunity_score', 0)
-    filtered = [s for s in filtered if s.get('opportunity_score', 0) >= min_score]
+    filtered = [s for s in filtered if _safe_float(s.get('opportunity_score', 0), 0.0) >= min_score]
     
     return filtered
 

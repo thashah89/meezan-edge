@@ -855,8 +855,13 @@ with tab_market:
                 progress_bar = st.progress(0, text="Starting refresh pipeline...")
                 try:
                     metrics_result, bt_result = _refresh_metrics_with_backtest(filtered_symbols, progress_bar)
+                    metrics_updated_count = (
+                        metrics_result.inserted_or_updated
+                        if hasattr(metrics_result, "inserted_or_updated")
+                        else metrics_result.get("updated_symbols", 0)
+                    )
                     st.success(
-                        f"Updated metrics for {metrics_result.get('updated_symbols', 0)} symbols and "
+                        f"Updated metrics for {metrics_updated_count} symbols and "
                         f"backtest recalibrated {bt_result.get('updated_symbols', 0)} symbols."
                     )
                     st.rerun()

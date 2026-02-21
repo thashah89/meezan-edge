@@ -50,7 +50,29 @@ from paper_trader import PaperTradingEngine, get_performance_metrics
 from ml_trainer import MLTrainer, MLPredictor, auto_train_if_due
 from halal_scraper import scrape_halal_stocks
 from zerodha_client import ZerodhaClient, ZerodhaConfigError
-from news_intel_engine import NewsIntelEngine
+try:
+    from news_intel_engine import NewsIntelEngine
+    NEWS_ENGINE_AVAILABLE = True
+except ModuleNotFoundError:
+    NEWS_ENGINE_AVAILABLE = False
+
+    class NewsIntelEngine:  # type: ignore[override]
+        """Fallback when optional news engine module is not available."""
+
+        def rank_breakout_candidates(self, symbols, company_map=None):
+            _ = company_map
+            return [
+                {
+                    "symbol": str(sym).upper(),
+                    "news_breakout_score": 50.0,
+                    "sentiment_bias": "neutral",
+                    "confidence": 0.0,
+                    "news_items": 0,
+                    "catalyst_hits": 0,
+                    "top_headlines": [],
+                }
+                for sym in (symbols or [])
+            ]
 
 # Initialize
 logging.basicConfig(level=logging.INFO)
@@ -1308,6 +1330,8 @@ with tab_market:
 
     st.markdown("---")
     st.subheader("📰 News Breakout Intelligence")
+    if not NEWS_ENGINE_AVAILABLE:
+        st.caption("`news_intel_engine.py` not found. Running in fallback mode (neutral news scoring).")
     company_map = {}
     try:
         if not stocks_df.empty:

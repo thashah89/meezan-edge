@@ -192,6 +192,38 @@ def _is_zerodha_auth_error(exc: Exception) -> bool:
     return any(marker in msg for marker in auth_markers)
 
 
+def _get_zerodha_reauth_remaining() -> str:
+    """
+    Return time remaining before the local 24h token persistence window expires.
+    """
+    try:
+        _ensure_runtime_kv_table()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT updated_at FROM app_runtime_kv WHERE key = 'zerodha_access_token'")
+        row = cur.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return "Re-auth window unavailable"
+
+        updated_at_raw = str(row[0])
+        if "T" in updated_at_raw:
+            updated_at = datetime.fromisoformat(updated_at_raw)
+        else:
+            updated_at = datetime.strptime(updated_at_raw, "%Y-%m-%d %H:%M:%S")
+
+        expiry = updated_at + timedelta(hours=ZERODHA_TOKEN_TTL_HOURS)
+        remaining = expiry - datetime.utcnow()
+        if remaining.total_seconds() <= 0:
+            return "Re-auth required now"
+
+        hours = int(remaining.total_seconds() // 3600)
+        minutes = int((remaining.total_seconds() % 3600) // 60)
+        return f"Re-auth in ~{hours}h {minutes}m"
+    except Exception:
+        return "Re-auth window unavailable"
+
+
 def handle_zerodha_auth_callback():
     """
     Handle Kite redirect callback (request_token in query params) and store
@@ -218,8 +250,6 @@ def handle_zerodha_auth_callback():
         for key in ("request_token", "action", "status"):
             if key in st.query_params:
                 del st.query_params[key]
-
-        st.success("Zerodha connected successfully.")
     except Exception as exc:
         _clear_persisted_zerodha_token()
         st.error(f"Zerodha authentication failed: {exc}")
@@ -494,6 +524,7 @@ with st.sidebar:
         sidebar_z_client = get_zerodha_client()
         if sidebar_z_client.is_authenticated:
             st.success("Connected")
+            st.caption(_get_zerodha_reauth_remaining())
         else:
             st.link_button("🔐 Connect Zerodha", sidebar_z_client.get_login_url(), use_container_width=True)
             st.caption("After login, return here to complete auth.")
@@ -652,31 +683,8 @@ with tab_market:
             if col in merged_df.columns:
                 merged_df[col] = pd.to_numeric(merged_df[col], errors="coerce")
 
-        price_vals = merged_df["ltp"].dropna() if "ltp" in merged_df.columns else pd.Series(dtype=float)
-        if not price_vals.empty:
-            min_price_data = float(max(1.0, np.floor(price_vals.min())))
-            max_price_data = float(np.ceil(price_vals.max()))
-            if max_price_data < min_price_data:
-                max_price_data = min_price_data
-        else:
-            min_price_data, max_price_data = 1.0, 5000.0
-
-        default_low = 100.0 if max_price_data >= 100 else min_price_data
-        default_high = max_price_data
-        if default_low > default_high:
-            default_low = min_price_data
-
-        fcol1, fcol2, fcol3 = st.columns(3)
+        fcol1, fcol2 = st.columns(2)
         with fcol1:
-            price_range = st.slider(
-                "Price Range (INR)",
-                min_value=float(min_price_data),
-                max_value=float(max_price_data),
-                value=(float(default_low), float(default_high)),
-                step=1.0,
-                help="Stocks outside this range are excluded from refresh/backtest.",
-            )
-        with fcol2:
             min_momentum_score = st.slider(
                 "Min Momentum Score",
                 min_value=0,
@@ -693,7 +701,7 @@ with tab_market:
                 step=0.1,
                 help="Require volume confirmation to back price movement.",
             )
-        with fcol3:
+        with fcol2:
             require_uptrend = st.checkbox(
                 "Uptrend Structure Only",
                 value=True,
@@ -701,8 +709,6 @@ with tab_market:
             )
 
         cond = pd.Series(True, index=merged_df.index)
-        if "ltp" in merged_df.columns:
-            cond &= merged_df["ltp"].between(price_range[0], price_range[1], inclusive="both")
         if "momentum_score" in merged_df.columns:
             cond &= merged_df["momentum_score"].fillna(0) >= min_momentum_score
         if "volume_ratio" in merged_df.columns:
@@ -832,54 +838,84 @@ with tab_market:
     if active_stocks:
         # Show stocks + metrics table directly
         st.markdown("#### 📋 Stocks")
-        if merged_df_filtered.empty:
-            st.info("No stocks match current filter. Widen the range or lower momentum/volume thresholds.")
+        if merged_df.empty:
+            st.info("No successful metric rows to display yet. Click Refresh Metrics.")
         else:
-            preferred_order = [
-                "symbol", "company", "sector",
-                "ltp", "opportunity_score", "strategy_fit", "win_probability", "expected_return",
-                "rsi", "adx", "macd", "macd_signal",
-                "sma_20", "sma_50", "sma_200", "ema_9", "ema_21",
-                "atr", "bb_upper", "bb_middle", "bb_lower", "bb_width",
-                "trend_score", "momentum_score", "volatility_score", "liquidity_score",
-                "volume_ratio", "date"
-            ]
-            front = [c for c in preferred_order if c in merged_df_filtered.columns]
-            rest = [c for c in merged_df_filtered.columns if c not in front]
-            display_df = merged_df_filtered[front + rest].copy()
+            # Separate display-only price filter (not part of universe refresh/backtest filter).
+            table_df_source = merged_df.copy()
+            if "ltp" in table_df_source.columns:
+                table_df_source["ltp"] = pd.to_numeric(table_df_source["ltp"], errors="coerce")
+                table_price_vals = table_df_source["ltp"].dropna()
+                if not table_price_vals.empty:
+                    table_min_price = float(max(1.0, np.floor(table_price_vals.min())))
+                    table_max_price = float(np.ceil(table_price_vals.max()))
+                    if table_max_price < table_min_price:
+                        table_max_price = table_min_price
+                    table_default_low = 100.0 if table_max_price >= 100 else table_min_price
+                    table_default_high = table_max_price
+                    if table_default_low > table_default_high:
+                        table_default_low = table_min_price
 
-            header_map = {
-                "symbol": "Symbol",
-                "company": "Company",
-                "sector": "Sector",
-                "ltp": "LTP",
-                "opportunity_score": "Opportunity Score",
-                "strategy_fit": "Strategy Fit",
-                "win_probability": "Win Probability",
-                "expected_return": "Expected Return",
-                "rsi": "RSI",
-                "adx": "ADX",
-                "macd": "MACD",
-                "macd_signal": "MACD Signal",
-                "sma_20": "SMA 20",
-                "sma_50": "SMA 50",
-                "sma_200": "SMA 200",
-                "ema_9": "EMA 9",
-                "ema_21": "EMA 21",
-                "atr": "ATR",
-                "bb_upper": "BB Upper",
-                "bb_middle": "BB Middle",
-                "bb_lower": "BB Lower",
-                "bb_width": "BB Width",
-                "trend_score": "Trend Score",
-                "momentum_score": "Momentum Score",
-                "volatility_score": "Volatility Score",
-                "liquidity_score": "Liquidity Score",
-                "volume_ratio": "Volume Ratio",
-                "date": "Date",
-            }
-            display_df = display_df.rename(columns=header_map)
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    table_price_range = st.slider(
+                        "Price Filter for Table (INR)",
+                        min_value=float(table_min_price),
+                        max_value=float(table_max_price),
+                        value=(float(table_default_low), float(table_default_high)),
+                        step=1.0,
+                        help="Display-only filter. Does not change refresh/backtest universe.",
+                    )
+                    table_df_source = table_df_source[
+                        table_df_source["ltp"].between(table_price_range[0], table_price_range[1], inclusive="both")
+                    ]
+
+            if table_df_source.empty:
+                st.info("No stocks in selected price range.")
+            else:
+                preferred_order = [
+                    "symbol", "company", "sector",
+                    "ltp", "opportunity_score", "strategy_fit", "win_probability", "expected_return",
+                    "rsi", "adx", "macd", "macd_signal",
+                    "sma_20", "sma_50", "sma_200", "ema_9", "ema_21",
+                    "atr", "bb_upper", "bb_middle", "bb_lower", "bb_width",
+                    "trend_score", "momentum_score", "volatility_score", "liquidity_score",
+                    "volume_ratio", "date"
+                ]
+                front = [c for c in preferred_order if c in table_df_source.columns]
+                rest = [c for c in table_df_source.columns if c not in front]
+                display_df = table_df_source[front + rest].copy()
+
+                header_map = {
+                    "symbol": "Symbol",
+                    "company": "Company",
+                    "sector": "Sector",
+                    "ltp": "LTP",
+                    "opportunity_score": "Opportunity Score",
+                    "strategy_fit": "Strategy Fit",
+                    "win_probability": "Win Probability",
+                    "expected_return": "Expected Return",
+                    "rsi": "RSI",
+                    "adx": "ADX",
+                    "macd": "MACD",
+                    "macd_signal": "MACD Signal",
+                    "sma_20": "SMA 20",
+                    "sma_50": "SMA 50",
+                    "sma_200": "SMA 200",
+                    "ema_9": "EMA 9",
+                    "ema_21": "EMA 21",
+                    "atr": "ATR",
+                    "bb_upper": "BB Upper",
+                    "bb_middle": "BB Middle",
+                    "bb_lower": "BB Lower",
+                    "bb_width": "BB Width",
+                    "trend_score": "Trend Score",
+                    "momentum_score": "Momentum Score",
+                    "volatility_score": "Volatility Score",
+                    "liquidity_score": "Liquidity Score",
+                    "volume_ratio": "Volume Ratio",
+                    "date": "Date",
+                }
+                display_df = display_df.rename(columns=header_map)
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
     
     else:
         st.info("No data loaded")

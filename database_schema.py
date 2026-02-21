@@ -539,28 +539,61 @@ def get_latest_metrics(symbol: str = None):
     """Get latest metrics for a stock or all stocks."""
     conn = get_connection()
     cursor = conn.cursor()
-    
-    if symbol:
-        cursor.execute("""
-            SELECT * FROM stock_metrics
-            WHERE symbol = ?
-            ORDER BY date DESC
-            LIMIT 1
-        """, (symbol,))
-    else:
-        cursor.execute("""
-            SELECT m.* FROM stock_metrics m
-            INNER JOIN (
-                SELECT symbol, MAX(date) as max_date
-                FROM stock_metrics
-                GROUP BY symbol
-            ) latest ON m.symbol = latest.symbol AND m.date = latest.max_date
-            ORDER BY m.opportunity_score DESC
-        """)
-    
-    results = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in results]
+    try:
+        cols = _table_columns(cursor, "stock_metrics")
+        if not cols:
+            return []
+
+        if symbol:
+            if "date" in cols:
+                cursor.execute(
+                    """
+                    SELECT * FROM stock_metrics
+                    WHERE symbol = ?
+                    ORDER BY date DESC
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM stock_metrics
+                    WHERE symbol = ?
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                )
+        else:
+            if {"symbol", "date"}.issubset(cols):
+                order_col = "m.opportunity_score DESC" if "opportunity_score" in cols else "m.symbol ASC"
+                cursor.execute(
+                    f"""
+                    SELECT m.* FROM stock_metrics m
+                    INNER JOIN (
+                        SELECT symbol, MAX(date) as max_date
+                        FROM stock_metrics
+                        GROUP BY symbol
+                    ) latest ON m.symbol = latest.symbol AND m.date = latest.max_date
+                    ORDER BY {order_col}
+                    """
+                )
+            else:
+                order_col = "opportunity_score DESC" if "opportunity_score" in cols else "symbol ASC"
+                cursor.execute(
+                    f"""
+                    SELECT * FROM stock_metrics
+                    ORDER BY {order_col}
+                    """
+                )
+
+        results = cursor.fetchall()
+        return [dict(row) for row in results]
+    except sqlite3.OperationalError as exc:
+        log.warning("get_latest_metrics fallback due to schema mismatch: %s", exc)
+        return []
+    finally:
+        conn.close()
 
 
 def get_open_trades():

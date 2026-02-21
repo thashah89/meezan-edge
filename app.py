@@ -394,14 +394,11 @@ def _is_live_market_hours(now_ist: datetime | None = None) -> bool:
     return market_open <= now_ist <= market_close
 
 
-def _fetch_nse_top_gainers_halal(halal_symbols: list[str], top_n: int = 10) -> pd.DataFrame:
+def _fetch_nse_top_gainers_with_halal_status(halal_symbols: list[str], top_n: int | None = None) -> pd.DataFrame:
     """
-    Fetch NSE top gainers and keep only symbols present in halal universe.
+    Fetch NSE top gainers and tag each row as Halal/Non-Halal using loaded universe.
     Returns empty DataFrame if data is unavailable.
     """
-    if not halal_symbols:
-        return pd.DataFrame()
-
     halal_set = {str(s).upper().strip() for s in halal_symbols if s}
     headers = {
         "User-Agent": (
@@ -451,9 +448,7 @@ def _fetch_nse_top_gainers_halal(halal_symbols: list[str], top_n: int = 10) -> p
             return pd.DataFrame()
 
         df["symbol"] = df[symbol_col].astype(str).str.upper().str.strip()
-        df = df[df["symbol"].isin(halal_set)]
-        if df.empty:
-            return df
+        df["Halal"] = np.where(df["symbol"].isin(halal_set), "Halal", "Non-Halal")
 
         rename_map = {
             "symbol": "Symbol",
@@ -478,11 +473,19 @@ def _fetch_nse_top_gainers_halal(halal_symbols: list[str], top_n: int = 10) -> p
             df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
             df = df.sort_values(by=sort_col, ascending=False)
 
-        preferred = [c for c in ["Symbol", "LTP", "Change %", "Open", "High", "Low", "Turnover (L)"] if c in df.columns]
+        preferred = [c for c in ["Symbol", "Halal", "LTP", "Change %", "Open", "High", "Low", "Turnover (L)"] if c in df.columns]
         rest = [c for c in df.columns if c not in preferred]
-        return df[preferred + rest].head(top_n).reset_index(drop=True)
+        out = df[preferred + rest].reset_index(drop=True)
+        return out.head(top_n) if top_n else out
     except Exception:
         return pd.DataFrame()
+
+
+def _highlight_halal_row(row: pd.Series):
+    is_halal = str(row.get("Halal", "")).strip().lower() == "halal"
+    bg = "#e8f7ee" if is_halal else "#fde8e8"
+    fg = "#0f5132" if is_halal else "#842029"
+    return [f"background-color: {bg}; color: {fg};" for _ in row]
 
 
 def _bootstrap_stock_universe_if_empty():
@@ -1228,14 +1231,18 @@ with tab_market:
                         use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.subheader("📈 NSE Top 10 Gainers (Halal Only)")
+    st.subheader("📈 NSE Top Gainers (All)")
     try:
         halal_symbols = [s.get("symbol") for s in active_stocks if s.get("symbol")]
-        gainers_df = _fetch_nse_top_gainers_halal(halal_symbols, top_n=10)
+        gainers_df = _fetch_nse_top_gainers_with_halal_status(halal_symbols, top_n=None)
         if gainers_df.empty:
-            st.info("NSE top gainers data unavailable right now or no overlap with loaded halal stocks.")
+            st.info("NSE top gainers data unavailable right now.")
         else:
-            st.dataframe(gainers_df, use_container_width=True, hide_index=True)
+            halal_count = int((gainers_df.get("Halal") == "Halal").sum()) if "Halal" in gainers_df.columns else 0
+            non_halal_count = int((gainers_df.get("Halal") == "Non-Halal").sum()) if "Halal" in gainers_df.columns else 0
+            st.caption(f"Halal: {halal_count} | Non-Halal: {non_halal_count}")
+            styled_gainers = gainers_df.style.apply(_highlight_halal_row, axis=1)
+            st.dataframe(styled_gainers, use_container_width=True, hide_index=True)
     except Exception as exc:
         st.warning(f"Could not load NSE gainers: {exc}")
 

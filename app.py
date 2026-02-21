@@ -29,6 +29,9 @@ from zoneinfo import ZoneInfo
 import logging
 import threading
 
+# Zerodha token persistence policy
+ZERODHA_TOKEN_TTL_HOURS = 24
+
 # Configure page
 st.set_page_config(
     page_title="🧠 Meezan Edge v3.0 — Autonomous Hedge Fund",
@@ -110,10 +113,33 @@ def _load_persisted_zerodha_token() -> str:
         _ensure_runtime_kv_table()
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT value FROM app_runtime_kv WHERE key = 'zerodha_access_token'")
+        cur.execute("SELECT value, updated_at FROM app_runtime_kv WHERE key = 'zerodha_access_token'")
         row = cur.fetchone()
+        if not row or not row[0]:
+            conn.close()
+            return ""
+
+        token = str(row[0]).strip()
+        updated_at_raw = str(row[1]) if len(row) > 1 and row[1] else ""
+
+        # Keep login usable across refreshes, but cap persistence at 24 hours.
+        if updated_at_raw:
+            try:
+                if "T" in updated_at_raw:
+                    updated_at = datetime.fromisoformat(updated_at_raw)
+                else:
+                    updated_at = datetime.strptime(updated_at_raw, "%Y-%m-%d %H:%M:%S")
+                token_age = datetime.utcnow() - updated_at
+                if token_age > timedelta(hours=ZERODHA_TOKEN_TTL_HOURS):
+                    cur.execute("DELETE FROM app_runtime_kv WHERE key = 'zerodha_access_token'")
+                    conn.commit()
+                    conn.close()
+                    return ""
+            except Exception:
+                pass
+
         conn.close()
-        return str(row[0]).strip() if row and row[0] else ""
+        return token
     except Exception:
         return ""
 
@@ -145,6 +171,25 @@ def _clear_persisted_zerodha_token():
         conn.close()
     except Exception:
         pass
+
+
+def _is_zerodha_auth_error(exc: Exception) -> bool:
+    """
+    Clear persisted token only for true auth/session failures.
+    Avoid clearing on non-auth issues like missing instrument token.
+    """
+    msg = str(exc).lower()
+    auth_markers = [
+        "tokenexception",
+        "invalid session",
+        "session expired",
+        "access token is invalid",
+        "invalid `api_key` or `access_token`",
+        "zerodha access token is missing",
+        "unauthorized",
+        "permission denied",
+    ]
+    return any(marker in msg for marker in auth_markers)
 
 
 def handle_zerodha_auth_callback():
@@ -736,7 +781,7 @@ with tab_market:
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
                 except Exception as exc:
-                    if "token" in str(exc).lower() or "auth" in str(exc).lower():
+                    if _is_zerodha_auth_error(exc):
                         _clear_persisted_zerodha_token()
                         st.session_state.pop("zerodha_access_token", None)
                     st.error(f"Metrics refresh failed: {exc}")
@@ -779,7 +824,7 @@ with tab_market:
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
                 except Exception as exc:
-                    if "token" in str(exc).lower() or "auth" in str(exc).lower():
+                    if _is_zerodha_auth_error(exc):
                         _clear_persisted_zerodha_token()
                         st.session_state.pop("zerodha_access_token", None)
                     st.error(f"Backtest failed: {exc}")

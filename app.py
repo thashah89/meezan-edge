@@ -1296,49 +1296,6 @@ with tab_market:
     
     st.markdown("---")
     
-    # ── Section D: Advanced Filters ──────────────────────────────────────────
-    st.subheader("🎯 Advanced Filters")
-    
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
-    
-    with filter_col1:
-        uptrend_only = st.checkbox("Uptrend Only", value=True)
-        strong_momentum = st.checkbox("Strong Momentum")
-        breakout_ready = st.checkbox("Breakout Ready")
-    
-    with filter_col2:
-        rsi_min = st.slider("Min RSI", 0, 100, 40)
-        rsi_max = st.slider("Max RSI", 0, 100, 70)
-    
-    with filter_col3:
-        adx_min = st.slider("Min ADX", 0, 50, 20)
-        strategy_filter = st.selectbox(
-            "Strategy Fit",
-            ['all', 'momentum', 'breakout', 'swing', 'mean_revert']
-        )
-    
-    # Apply filters
-    filters = {
-        'uptrend_only': uptrend_only,
-        'strong_momentum': strong_momentum,
-        'breakout_ready': breakout_ready,
-        'rsi_min': rsi_min,
-        'rsi_max': rsi_max,
-        'adx_min': adx_min,
-        'strategy_fit': strategy_filter if strategy_filter != 'all' else None
-    }
-    
-    if metrics_list and scored and st.button("Apply Filters"):
-        from market_intel_engine import apply_filters
-        filtered = apply_filters(scored, filters)
-        
-        st.success(f"Found {len(filtered)} stocks matching filters")
-        
-        if filtered:
-            df_filt = pd.DataFrame(filtered)
-            st.dataframe(df_filt[['symbol', 'opportunity_score', 'strategy_fit']], 
-                        use_container_width=True, hide_index=True)
-
     st.markdown("---")
     st.subheader("📈 NSE Top Gainers (All)")
     try:

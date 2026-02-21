@@ -349,11 +349,10 @@ class ZerodhaClient:
         updated_symbols = 0
         failed_symbols = 0
         strategy_distribution: Dict[str, int] = {}
+        strategy_rules = self._strategy_rules()
         global_stats = {
-            "momentum": {"trades": 0, "wins": 0, "sum_return": 0.0},
-            "breakout": {"trades": 0, "wins": 0, "sum_return": 0.0},
-            "swing": {"trades": 0, "wins": 0, "sum_return": 0.0},
-            "mean_revert": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            name: {"trades": 0, "wins": 0, "sum_return": 0.0}
+            for name in strategy_rules.keys()
         }
 
         instrument_token_by_symbol: Dict[str, int] = {}
@@ -871,11 +870,10 @@ class ZerodhaClient:
         return ai_win, ai_profit
 
     def _backtest_strategies(self, ind_df: pd.DataFrame, hold_days: int = 5) -> Dict[str, Dict]:
+        rules = self._strategy_rules()
         stats = {
-            "momentum": {"trades": 0, "wins": 0, "sum_return": 0.0},
-            "breakout": {"trades": 0, "wins": 0, "sum_return": 0.0},
-            "swing": {"trades": 0, "wins": 0, "sum_return": 0.0},
-            "mean_revert": {"trades": 0, "wins": 0, "sum_return": 0.0},
+            name: {"trades": 0, "wins": 0, "sum_return": 0.0}
+            for name in rules.keys()
         }
         if ind_df.empty or len(ind_df) <= hold_days + 60:
             return {k: {"trades": 0, "wins": 0, "win_rate": 0.5, "avg_return": 0.0, "sum_return": 0.0} for k in stats}
@@ -912,6 +910,26 @@ class ZerodhaClient:
 
     @classmethod
     def _strategy_signal(cls, row, strategy: str) -> bool:
+        rule = cls._strategy_rules().get(strategy)
+        if not rule:
+            return False
+        return bool(rule(row))
+
+    @staticmethod
+    def _strategy_rules() -> Dict[str, Callable]:
+        """
+        Strategy registry for backtesting.
+        Add new strategies here; backtest loop picks them up automatically.
+        """
+        return {
+            "momentum": ZerodhaClient._rule_momentum,
+            "breakout": ZerodhaClient._rule_breakout,
+            "swing": ZerodhaClient._rule_swing,
+            "mean_revert": ZerodhaClient._rule_mean_revert,
+        }
+
+    @classmethod
+    def _rule_momentum(cls, row) -> bool:
         close = cls._safe_float(row.get("close"), 0.0)
         rsi = cls._safe_float(row.get("RSI"), 50.0)
         adx = cls._safe_float(row.get("ADX"), 20.0)
@@ -919,20 +937,32 @@ class ZerodhaClient:
         macd_signal = cls._safe_float(row.get("MACD_Signal"), 0.0)
         sma20 = cls._safe_float(row.get("SMA_20"), close)
         sma50 = cls._safe_float(row.get("SMA_50"), close)
-        sma200 = cls._safe_float(row.get("SMA_200"), close)
+        return close > sma20 and sma20 > sma50 and rsi >= 55 and adx >= 22 and macd > macd_signal
+
+    @classmethod
+    def _rule_breakout(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        sma20 = cls._safe_float(row.get("SMA_20"), close)
         bb_width_raw = cls._safe_float(row.get("BB_Width"), 0.0)
         bb_width = bb_width_raw / 100.0 if bb_width_raw > 1 else bb_width_raw
         volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        return close > sma20 and bb_width <= 0.035 and volume_ratio >= 1.1 and adx >= 18
 
-        if strategy == "momentum":
-            return close > sma20 and sma20 > sma50 and rsi >= 55 and adx >= 22 and macd > macd_signal
-        if strategy == "breakout":
-            return close > sma20 and bb_width <= 0.035 and volume_ratio >= 1.1 and adx >= 18
-        if strategy == "swing":
-            return close > sma50 and sma50 >= sma200 and 40 <= rsi <= 65 and adx >= 16
-        if strategy == "mean_revert":
-            return rsi <= 35 and adx <= 22
-        return False
+    @classmethod
+    def _rule_swing(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        sma50 = cls._safe_float(row.get("SMA_50"), close)
+        sma200 = cls._safe_float(row.get("SMA_200"), close)
+        return close > sma50 and sma50 >= sma200 and 40 <= rsi <= 65 and adx >= 16
+
+    @classmethod
+    def _rule_mean_revert(cls, row) -> bool:
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        return rsi <= 35 and adx <= 22
 
     @staticmethod
     def _pick_best_strategy(backtest: Dict[str, Dict]) -> Tuple[str, Dict]:

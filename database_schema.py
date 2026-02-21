@@ -12,7 +12,7 @@ import logging
 
 log = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent.parent / "meezan_v3.db"
+DB_PATH = Path(__file__).resolve().parent / "meezan_v3.db"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCHEMA DEFINITIONS

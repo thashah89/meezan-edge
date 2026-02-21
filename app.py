@@ -24,6 +24,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 import logging
 import threading
 
@@ -192,6 +193,79 @@ def _run_backend_training():
         )
     except Exception as exc:
         log.warning("Background retrain skipped: %s", exc)
+
+
+def _is_live_market_hours(now_ist: datetime | None = None) -> bool:
+    """
+    NSE cash market hours (IST): Mon-Fri, 09:15 to 15:30.
+    """
+    now_ist = now_ist or datetime.now(ZoneInfo("Asia/Kolkata"))
+    if now_ist.weekday() >= 5:
+        return False
+    market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now_ist <= market_close
+
+
+def _bootstrap_stock_universe_if_empty():
+    """
+    If DB has no stocks (fresh deploy/restart), bootstrap from scraper cache.
+    """
+    if st.session_state.get("stock_universe_bootstrap_done"):
+        return
+
+    try:
+        active = get_active_stocks()
+        if active:
+            st.session_state["stock_universe_bootstrap_done"] = True
+            return
+
+        stocks = scrape_halal_stocks(force_refresh=False)
+        if not stocks:
+            st.session_state["stock_universe_bootstrap_done"] = True
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+        load_date = date.today()
+        valid_till = load_date + timedelta(days=config.STOCK_UNIVERSE_VALID_DAYS)
+        inserted = 0
+
+        for stock in stocks:
+            symbol = str(stock.get("symbol", "")).strip().upper()
+            if ":" in symbol:
+                symbol = symbol.split(":", 1)[1]
+            if symbol.endswith(".NS"):
+                symbol = symbol[:-3]
+            if not symbol:
+                continue
+
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO stocks_master
+                (symbol, company, sector, load_date, valid_till, is_active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    symbol,
+                    stock.get("company", symbol),
+                    stock.get("sector", stock.get("industry", "Unknown")),
+                    load_date,
+                    valid_till,
+                ),
+            )
+            inserted += 1
+
+        conn.commit()
+        conn.close()
+        log.info("Stock universe bootstrap inserted %s rows", inserted)
+    except Exception as exc:
+        log.warning("Stock universe bootstrap skipped: %s", exc)
+    finally:
+        st.session_state["stock_universe_bootstrap_done"] = True
+
+
+_bootstrap_stock_universe_if_empty()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CUSTOM CSS
@@ -565,38 +639,41 @@ with tab_market:
     # ── Section B: Market Sentiment Engine ───────────────────────────────────
     st.subheader("🌡️ Market Sentiment Analysis")
     
-    # Analyze market (mock for now - would use real Nifty data)
-    sentiment = engines['intel'].analyze_market()
-    
-    # Display sentiment
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        sentiment_emoji = {
-            'aggressive_bullish': '🚀',
-            'bullish': '🟢',
-            'bearish': '🔴',
-            'sideways': '⏸️',
-            'high_vol': '⚡'
-        }.get(sentiment['sentiment'], '⏸️')
-        
-        st.metric(
-            "Market Regime",
-            sentiment['sentiment'].replace('_', ' ').title(),
-            sentiment_emoji
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    if _is_live_market_hours(now_ist):
+        sentiment = engines['intel'].analyze_market()
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            sentiment_emoji = {
+                'aggressive_bullish': '??',
+                'bullish': '??',
+                'bearish': '??',
+                'sideways': '??',
+                'high_vol': '?'
+            }.get(sentiment['sentiment'], '??')
+            st.metric(
+                "Market Regime",
+                sentiment['sentiment'].replace('_', ' ').title(),
+                sentiment_emoji
+            )
+
+        with col2:
+            st.metric("Confidence", f"{sentiment['confidence']:.0f}%")
+
+        with col3:
+            st.metric("Deployment", f"{sentiment['deployment_pct']:.0%}")
+
+        with col4:
+            st.metric("Volatility", sentiment['volatility'].title())
+
+        st.info(f"**Recommended Style:** {sentiment['recommended_style']}")
+        st.info(f"**Capital Split:** Intraday {sentiment['intraday_pct']:.0%} | Swing {sentiment['swing_pct']:.0%}")
+    else:
+        st.info(
+            f"Market sentiment is available only during live market hours (Mon-Fri, 09:15-15:30 IST). "
+            f"Current IST: {now_ist.strftime('%Y-%m-%d %H:%M:%S')}"
         )
-    
-    with col2:
-        st.metric("Confidence", f"{sentiment['confidence']:.0f}%")
-    
-    with col3:
-        st.metric("Deployment", f"{sentiment['deployment_pct']:.0%}")
-    
-    with col4:
-        st.metric("Volatility", sentiment['volatility'].title())
-    
-    st.info(f"**Recommended Style:** {sentiment['recommended_style']}")
-    st.info(f"**Capital Split:** Intraday {sentiment['intraday_pct']:.0%} · Swing {sentiment['swing_pct']:.0%}")
     
     st.markdown("---")
     
@@ -1291,3 +1368,4 @@ with tab_ai:
 st.markdown("---")
 st.caption("🧠 Meezan Edge v3.0 — Autonomous Halal Hedge Fund System | Profit Maximization Mode")
 st.caption("⚠️ PAPER TRADING ONLY — No real capital deployment")
+

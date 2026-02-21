@@ -6,6 +6,7 @@ PROFIT MAXIMIZATION MODE:
 - Risk: Controlled with daily limits
 - Deployment: Aggressive when confidence high
 """
+from pathlib import Path
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CAPITAL & RISK MANAGEMENT
@@ -69,7 +70,7 @@ BROKERAGE_PER_TRADE = 20  # ₹20 flat
 #  DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
-DB_PATH = "meezan_v3.db"
+DB_PATH = str((Path(__file__).resolve().parent / "meezan_v3.db"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PROFIT MAXIMIZATION STRATEGIES
@@ -102,4 +103,5 @@ TARGET_MONTHLY_RETURN = 0.15  # 15% minimum
 TARGET_WIN_RATE = 0.65  # 65% win rate
 MAX_DRAWDOWN = 0.10  # 10% max drawdown
 TARGET_SHARPE = 2.0  # Sharpe ratio 2.0
+
 

@@ -688,11 +688,11 @@ class ZerodhaClient:
                     continue
 
                 try:
-                    interval_plan = [
-                        ("day", max(120, lookback_days), hold_days, 1.0),
-                        ("60minute", min(120, lookback_days), max(16, hold_days * 6), 0.8),
-                        ("15minute", min(60, lookback_days), max(24, hold_days * 12), 0.6),
-                    ]
+                    interval_plan = self._build_interval_plan(
+                        total_symbols=len(symbols),
+                        lookback_days=lookback_days,
+                        hold_days=hold_days,
+                    )
                     combined_backtest = {
                         name: {"trades": 0, "wins": 0, "sum_return": 0.0}
                         for name in strategy_rules.keys()
@@ -700,7 +700,7 @@ class ZerodhaClient:
                     latest = None
                     usable_intervals = 0
 
-                    for interval, lb_days, interval_hold, weight in interval_plan:
+                    for interval, lb_days, interval_hold, weight, max_trades_cap in interval_plan:
                         try:
                             interval_from = date.today() - timedelta(days=max(20, lb_days))
                             candles = self.kite.historical_data(
@@ -724,6 +724,7 @@ class ZerodhaClient:
                                 hold_days=interval_hold,
                                 symbol=symbol,
                                 timeframe=interval,
+                                max_trades_per_strategy=max_trades_cap,
                             )
                             backtest_tf = backtest_out.get("stats", {})
                             self._persist_backtest_trades(cur, run_id, backtest_out.get("trades", []))
@@ -850,7 +851,33 @@ class ZerodhaClient:
             "failures": failures,
             "strategy_distribution": strategy_distribution,
             "timeframe_coverage": timeframe_coverage,
+            "intervals_used": [p[0] for p in self._build_interval_plan(len(symbols), lookback_days, hold_days)],
         }
+
+    @staticmethod
+    def _build_interval_plan(
+        total_symbols: int,
+        lookback_days: int,
+        hold_days: int,
+    ) -> List[Tuple[str, int, int, float, Optional[int]]]:
+        """
+        Dynamic interval plan to keep backtests responsive on larger universes.
+        Tuple: (interval, lookback_days, hold_bars, weight, max_trades_per_strategy)
+        """
+        if total_symbols >= 220:
+            return [
+                ("day", max(120, lookback_days), hold_days, 1.0, None),
+            ]
+        if total_symbols >= 120:
+            return [
+                ("day", max(120, lookback_days), hold_days, 1.0, None),
+                ("60minute", min(90, lookback_days), max(14, hold_days * 5), 0.75, 180),
+            ]
+        return [
+            ("day", max(120, lookback_days), hold_days, 1.0, None),
+            ("60minute", min(120, lookback_days), max(16, hold_days * 6), 0.8, 220),
+            ("15minute", min(60, lookback_days), max(24, hold_days * 12), 0.6, 120),
+        ]
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
@@ -1206,8 +1233,10 @@ class ZerodhaClient:
         hold_days: int = 5,
         symbol: str = "",
         timeframe: str = "day",
+        max_trades_per_strategy: Optional[int] = None,
     ) -> Dict[str, Any]:
         rules = self._strategy_rules()
+        rule_items = list(rules.items())
         stats = {
             name: {"trades": 0, "wins": 0, "sum_return": 0.0}
             for name in rules.keys()
@@ -1229,10 +1258,14 @@ class ZerodhaClient:
             row_day = pd.to_datetime(row.get("date"), errors="coerce")
             day_key = str(row_day.date()) if pd.notna(row_day) else f"idx_{i}"
 
-            for strat in stats.keys():
+            all_capped = True
+            for strat, rule_fn in rule_items:
+                if max_trades_per_strategy is not None and stats[strat]["trades"] >= max_trades_per_strategy:
+                    continue
+                all_capped = False
                 if strat in daily_once_strategies and day_key in traded_days.get(strat, set()):
                     continue
-                if self._strategy_signal(row, strat):
+                if rule_fn(row):
                     trade_result = self._simulate_trade_return(
                         ind_df=ind_df,
                         entry_idx=i,
@@ -1262,6 +1295,8 @@ class ZerodhaClient:
                     )
                     if strat in daily_once_strategies:
                         traded_days[strat].add(day_key)
+            if all_capped:
+                break
 
         out = {}
         for strat, agg in stats.items():

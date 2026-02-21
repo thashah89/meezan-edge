@@ -1466,6 +1466,47 @@ with tab_backtest:
                     help="Used to translate % returns into currency growth/loss.",
                     key=f"bt_start_capital_{selected_run_id}",
                 )
+                st.markdown("##### Capital Protection Controls")
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                with rc1:
+                    risk_per_trade_pct = st.number_input(
+                        "Risk / Trade (%)",
+                        min_value=0.25,
+                        max_value=3.0,
+                        value=1.0,
+                        step=0.25,
+                        format="%.2f",
+                        key=f"bt_risk_trade_{selected_run_id}",
+                    )
+                with rc2:
+                    max_daily_loss_pct = st.number_input(
+                        "Max Daily Loss (%)",
+                        min_value=0.5,
+                        max_value=10.0,
+                        value=2.0,
+                        step=0.5,
+                        format="%.2f",
+                        key=f"bt_daily_loss_{selected_run_id}",
+                    )
+                with rc3:
+                    max_drawdown_pct = st.number_input(
+                        "Max Drawdown (%)",
+                        min_value=2.0,
+                        max_value=40.0,
+                        value=10.0,
+                        step=1.0,
+                        format="%.1f",
+                        key=f"bt_max_dd_{selected_run_id}",
+                    )
+                with rc4:
+                    max_trades_per_day = st.number_input(
+                        "Max Trades / Day",
+                        min_value=1,
+                        max_value=10,
+                        value=3,
+                        step=1,
+                        key=f"bt_max_tpd_{selected_run_id}",
+                    )
 
                 total_trades = len(filtered_df)
                 wins = int((filtered_df["return_pct"] > 0).sum())
@@ -1488,17 +1529,70 @@ with tab_backtest:
                 growth_df["order_date"] = growth_df["order_date"].fillna(pd.Timestamp.min)
                 growth_df = growth_df.sort_values(by=["order_date", "symbol"], ascending=[True, True]).reset_index(drop=True)
                 running_capital = float(starting_capital)
+                min_allowed_capital = float(starting_capital) * (1.0 - (float(max_drawdown_pct) / 100.0))
+                risk_frac = float(risk_per_trade_pct) / 100.0
+                daily_loss_frac = float(max_daily_loss_pct) / 100.0
                 per_trade_pnl = []
                 post_trade_equity = []
-                for ret in pd.to_numeric(growth_df["return_pct"], errors="coerce").fillna(0.0).tolist():
-                    trade_pnl = running_capital * (float(ret) / 100.0)
+                trade_action = []
+                current_day = None
+                day_pnl = 0.0
+                day_trades = 0
+                stopped_by_drawdown = False
+                skipped_daily_limit = 0
+                skipped_trade_limit = 0
+
+                # Protected simulation:
+                # - risk only a small fraction per trade
+                # - cap per-trade R multiple
+                # - stop trading day after daily loss cap
+                # - stop all trading after max drawdown breach
+                for row in growth_df.itertuples(index=False):
+                    trade_date = row.order_date.date() if pd.notna(row.order_date) else None
+                    if current_day != trade_date:
+                        current_day = trade_date
+                        day_pnl = 0.0
+                        day_trades = 0
+
+                    if running_capital <= min_allowed_capital:
+                        stopped_by_drawdown = True
+                        per_trade_pnl.append(0.0)
+                        post_trade_equity.append(running_capital)
+                        trade_action.append("Skipped: max drawdown reached")
+                        continue
+
+                    if day_pnl <= -(running_capital * daily_loss_frac):
+                        skipped_daily_limit += 1
+                        per_trade_pnl.append(0.0)
+                        post_trade_equity.append(running_capital)
+                        trade_action.append("Skipped: daily loss cap")
+                        continue
+
+                    if day_trades >= int(max_trades_per_day):
+                        skipped_trade_limit += 1
+                        per_trade_pnl.append(0.0)
+                        post_trade_equity.append(running_capital)
+                        trade_action.append("Skipped: max trades/day")
+                        continue
+
+                    ret_pct = float(getattr(row, "return_pct", 0.0) or 0.0)
+                    # Convert return to R-equivalent and cap tail risk.
+                    r_multiple = max(-1.0, min(2.5, ret_pct / 1.0))
+                    trade_pnl = running_capital * risk_frac * r_multiple
                     running_capital += trade_pnl
+                    day_pnl += trade_pnl
+                    day_trades += 1
                     per_trade_pnl.append(trade_pnl)
                     post_trade_equity.append(running_capital)
+                    trade_action.append("Executed")
+
                 growth_df["trade_pnl_inr"] = per_trade_pnl
                 growth_df["equity_after_trade"] = post_trade_equity
+                growth_df["trade_action"] = trade_action
                 ending_capital_compounded = running_capital
                 pnl_compounded = ending_capital_compounded - starting_capital
+                protected_return_pct = ((ending_capital_compounded - starting_capital) / starting_capital * 100.0) if starting_capital > 0 else 0.0
+                executed_trades = int((growth_df["trade_action"] == "Executed").sum()) if not growth_df.empty else 0
 
                 k1, k2, k3, k4, k5 = st.columns(5)
                 k1.metric("Trades", f"{total_trades}")
@@ -1510,7 +1604,12 @@ with tab_backtest:
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Total P&L (₹, Flat)", f"₹{pnl_flat:,.0f}", f"{total_return_pct:.2f}%")
                 c2.metric("Ending Capital (₹, Flat)", f"₹{ending_capital_flat:,.0f}")
-                c3.metric("Ending Capital (₹, Compounded)", f"₹{ending_capital_compounded:,.0f}", f"₹{pnl_compounded:,.0f}")
+                c3.metric("Ending Capital (₹, Protected)", f"₹{ending_capital_compounded:,.0f}", f"{protected_return_pct:.2f}%")
+                st.caption(
+                    f"Protected simulation: executed {executed_trades}/{total_trades} trades | "
+                    f"skipped daily-cap {skipped_daily_limit} | skipped trade-cap {skipped_trade_limit}"
+                    + (" | drawdown stop triggered" if stopped_by_drawdown else "")
+                )
 
                 symbol_summary = (
                     filtered_df.groupby("symbol", as_index=False)
@@ -1564,7 +1663,7 @@ with tab_backtest:
                     }
                 )
                 if not growth_df.empty and "symbol" in growth_df.columns:
-                    growth_cols = growth_df[["symbol", "entry_date", "trade_pnl_inr", "equity_after_trade"]].copy()
+                    growth_cols = growth_df[["symbol", "entry_date", "trade_pnl_inr", "equity_after_trade", "trade_action"]].copy()
                     growth_cols["symbol"] = growth_cols["symbol"].astype(str)
                     growth_cols["entry_date"] = growth_cols["entry_date"].astype(str)
                     trade_table["Symbol"] = trade_table["Symbol"].astype(str)
@@ -1576,6 +1675,7 @@ with tab_backtest:
                                 "entry_date": "Entry Date",
                                 "trade_pnl_inr": "Trade P&L (INR)",
                                 "equity_after_trade": "Equity After Trade (INR)",
+                                "trade_action": "Action",
                             }
                         ),
                         on=["Symbol", "Entry Date"],
@@ -1597,6 +1697,7 @@ with tab_backtest:
                     "Reco Source": "none",
                     "Trade P&L (INR)": 0.0,
                     "Equity After Trade (INR)": starting_capital,
+                    "Action": "Executed",
                 }.items():
                     if missing_col not in trade_table.columns:
                         trade_table[missing_col] = default_val
@@ -1614,6 +1715,7 @@ with tab_backtest:
                             "Stop",
                             "Target",
                             "Return %",
+                            "Action",
                             "Trade P&L (INR)",
                             "Equity After Trade (INR)",
                             "Outcome",

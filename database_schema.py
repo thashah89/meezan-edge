@@ -504,15 +504,35 @@ def get_active_stocks():
     """Get all active stocks in the universe."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT symbol, company, sector, load_date, valid_till
-        FROM stocks_master
-        WHERE is_active = 1
-        ORDER BY symbol
-    """)
-    results = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in results]
+    try:
+        cols = _table_columns(cursor, "stocks_master")
+        if "symbol" not in cols:
+            return []
+
+        select_cols = [
+            "symbol",
+            "company" if "company" in cols else "symbol AS company",
+            "sector" if "sector" in cols else "'Unknown' AS sector",
+            "load_date" if "load_date" in cols else "DATE('now') AS load_date",
+            "valid_till" if "valid_till" in cols else "DATE('now', '+30 day') AS valid_till",
+        ]
+        where_clause = "WHERE is_active = 1" if "is_active" in cols else ""
+
+        cursor.execute(
+            f"""
+            SELECT {", ".join(select_cols)}
+            FROM stocks_master
+            {where_clause}
+            ORDER BY symbol
+            """
+        )
+        results = cursor.fetchall()
+        return [dict(row) for row in results]
+    except sqlite3.OperationalError as exc:
+        log.warning("get_active_stocks fallback due to schema mismatch: %s", exc)
+        return []
+    finally:
+        conn.close()
 
 
 def get_latest_metrics(symbol: str = None):

@@ -854,16 +854,29 @@ with tab_market:
             else:
                 progress_bar = st.progress(0, text="Starting refresh pipeline...")
                 try:
-                    metrics_result, bt_result = _refresh_metrics_with_backtest(filtered_symbols, progress_bar)
+                    z_client = get_zerodha_client()
+
+                    def _on_metrics_progress(done: int, total: int, sym: str, status: str):
+                        ratio = 0.0 if total <= 0 else done / total
+                        progress_bar.progress(
+                            min(0.95, ratio),
+                            text=f"Refreshing metrics {done}/{total}: {sym} ({status})",
+                        )
+
+                    metrics_result = z_client.refresh_latest_metrics(
+                        filtered_symbols,
+                        progress_cb=_on_metrics_progress,
+                    )
+                    progress_bar.progress(0.98, text="Refreshing sector buckets...")
+                    z_client.refresh_sector_buckets(filtered_symbols)
+                    progress_bar.progress(1.0, text="Metrics refresh complete.")
+
                     metrics_updated_count = (
                         metrics_result.inserted_or_updated
                         if hasattr(metrics_result, "inserted_or_updated")
                         else metrics_result.get("updated_symbols", 0)
                     )
-                    st.success(
-                        f"Updated metrics for {metrics_updated_count} symbols and "
-                        f"backtest recalibrated {bt_result.get('updated_symbols', 0)} symbols."
-                    )
+                    st.success(f"Updated metrics for {metrics_updated_count} symbols.")
                     st.rerun()
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
@@ -1026,8 +1039,19 @@ with tab_market:
     metrics_list = get_latest_metrics()
     
     if metrics_list:
-        # Score opportunities
-        scored = engines['intel'].score_opportunities(metrics_list)
+        # Score opportunities (defensive: tolerate partial/bad rows)
+        scored = []
+        try:
+            cleaned_metrics = []
+            for row in metrics_list:
+                try:
+                    cleaned_metrics.append(dict(row) if not isinstance(row, dict) else row)
+                except Exception:
+                    continue
+            scored = engines['intel'].score_opportunities(cleaned_metrics)
+        except Exception as exc:
+            log.warning("Opportunity scoring failed on current metrics batch: %s", exc)
+            st.warning("Opportunity scoring skipped for some invalid rows. Please refresh metrics.")
         
         # Display top 20
         top_20 = scored[:20]
@@ -1036,14 +1060,18 @@ with tab_market:
             df_opp = pd.DataFrame(top_20)
             
             # Format for display
+            win_prob_series = pd.to_numeric(df_opp.get('win_probability', 0.5), errors='coerce').fillna(0.5)
+            expected_series = pd.to_numeric(df_opp.get('expected_return', 0), errors='coerce').fillna(0.0)
+            rsi_series = pd.to_numeric(df_opp.get('rsi', 50), errors='coerce').fillna(50.0)
+            adx_series = pd.to_numeric(df_opp.get('adx', 0), errors='coerce').fillna(0.0)
             df_display = pd.DataFrame({
                 'Symbol': df_opp['symbol'],
                 'Score': df_opp['opportunity_score'],
                 'Strategy': df_opp['strategy_fit'].str.title(),
-                'Win Prob': df_opp.get('win_probability', 0.5).apply(lambda x: f"{x:.0%}"),
-                'Expected': df_opp.get('expected_return', 0).apply(lambda x: f"{x:.1f}%"),
-                'RSI': df_opp.get('rsi', 50).apply(lambda x: f"{x:.0f}"),
-                'ADX': df_opp.get('adx', 0).apply(lambda x: f"{x:.0f}"),
+                'Win Prob': win_prob_series.apply(lambda x: f"{x:.0%}"),
+                'Expected': expected_series.apply(lambda x: f"{x:.1f}%"),
+                'RSI': rsi_series.apply(lambda x: f"{x:.0f}"),
+                'ADX': adx_series.apply(lambda x: f"{x:.0f}"),
             })
             
             st.dataframe(

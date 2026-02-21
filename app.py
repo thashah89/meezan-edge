@@ -82,7 +82,6 @@ OPERATION_VERSIONS = {
     "refresh_metrics": "1.3.0",
     "backtest_ai_boost": "1.2.0",
     "potential_stock_list": "1.0.0",
-    "first4h_reversal_scan": "1.0.0",
 }
 
 
@@ -995,20 +994,6 @@ with tab_market:
                         hold_days=5,
                         progress_cb=_on_backtest_progress,
                     )
-                    progress_bar.progress(0.92, text="Running 4H first-candle reversal strategy...")
-                    try:
-                        scan_result = z_client.scan_first4h_reversal_strategy(
-                            symbols=filtered_symbols,
-                            trade_date=date.today(),
-                        )
-                        st.session_state["first4h_reversal_scan_result"] = scan_result
-                        _mark_operation_run("first4h_reversal_scan")
-                    except Exception as scan_exc:
-                        st.session_state["first4h_reversal_scan_result"] = {
-                            "signals": [],
-                            "failed": 0,
-                            "failures": [("scan", str(scan_exc))],
-                        }
                     progress_bar.progress(1.0, text="Backtest complete.")
                     st.success(
                         f"Backtest + AI calibration updated {bt_result['updated_symbols']} symbols"
@@ -1229,38 +1214,6 @@ with tab_market:
                 ascending=[False, False, False],
             ).head(30)
 
-            # Merge 4H first-candle reversal signals generated during backtest.
-            scan_state = st.session_state.get("first4h_reversal_scan_result") or {}
-            scan_signals = scan_state.get("signals", []) if isinstance(scan_state, dict) else []
-            if scan_signals:
-                scan_df = pd.DataFrame(scan_signals).copy()
-                if not scan_df.empty and "symbol" in scan_df.columns:
-                    scan_df["symbol"] = scan_df["symbol"].astype(str).str.upper().str.strip()
-                    entry_s = pd.to_numeric(scan_df.get("entry", 0), errors="coerce").fillna(0.0)
-                    target_s = pd.to_numeric(scan_df.get("target", 0), errors="coerce").fillna(0.0)
-                    expected_pct = np.where(
-                        entry_s > 0,
-                        ((target_s - entry_s) / entry_s) * 100.0,
-                        0.0,
-                    )
-                    scan_rows = pd.DataFrame(
-                        {
-                            "symbol": scan_df["symbol"],
-                            "Potential Setup": "4H Reversal",
-                            "opportunity_score": 90.0,
-                            "strategy_fit": "first4h_reversal",
-                            "win_probability": 0.60,
-                            "expected_return": expected_pct,
-                            "rsi": np.nan,
-                            "adx": np.nan,
-                            "ltp": entry_s,
-                        }
-                    )
-                    potential_df = pd.concat([scan_rows, potential_df], ignore_index=True, sort=False)
-                    if "symbol" in potential_df.columns:
-                        potential_df["symbol"] = potential_df["symbol"].astype(str).str.upper().str.strip()
-                        potential_df = potential_df.drop_duplicates(subset=["symbol"], keep="first")
-
             if not potential_df.empty:
                 st.caption(
                     "Focus buckets: Breakout, Trend Reversal, and High Potential based on score, trend, momentum, and liquidity."
@@ -1390,6 +1343,7 @@ with tab_backtest:
                 AVG(return_pct) AS avg_return,
                 MAX(created_at) AS updated_at
             FROM backtest_trades
+            WHERE strategy_name = 'vwap_pullback'
             GROUP BY run_id
             ORDER BY MAX(created_at) DESC
             LIMIT 20
@@ -1432,6 +1386,7 @@ with tab_backtest:
                     created_at
                 FROM backtest_trades
                 WHERE run_id = ?
+                  AND strategy_name = 'vwap_pullback'
                 ORDER BY entry_date DESC, symbol ASC
                 """,
                 (selected_run_id,),
@@ -1486,21 +1441,17 @@ with tab_backtest:
                     if col_name not in trades_df.columns:
                         trades_df[col_name] = default_val
 
-                strategy_options = sorted(trades_df["strategy_name"].dropna().astype(str).unique().tolist())
                 timeframe_options = sorted(trades_df["timeframe"].dropna().astype(str).unique().tolist())
                 outcome_options = sorted(trades_df["outcome"].dropna().astype(str).unique().tolist())
 
-                f1, f2, f3 = st.columns(3)
+                f1, f2 = st.columns(2)
                 with f1:
-                    selected_strategies = st.multiselect("Strategy Filter", strategy_options, default=strategy_options)
-                with f2:
                     selected_timeframes = st.multiselect("Timeframe Filter", timeframe_options, default=timeframe_options)
-                with f3:
+                with f2:
                     selected_outcomes = st.multiselect("Outcome Filter", outcome_options, default=outcome_options)
 
                 filtered_df = trades_df[
-                    trades_df["strategy_name"].isin(selected_strategies)
-                    & trades_df["timeframe"].isin(selected_timeframes)
+                    trades_df["timeframe"].isin(selected_timeframes)
                     & trades_df["outcome"].isin(selected_outcomes)
                 ].copy()
 
@@ -1523,57 +1474,33 @@ with tab_backtest:
                 k4.metric("Expectancy", f"{expectancy:.2f}%")
                 k5.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor > 0 else "n/a")
 
-                d1, d2 = st.columns(2)
-                with d1:
-                    strategy_summary = (
-                        filtered_df.groupby("strategy_name", as_index=False)
-                        .agg(
-                            trades=("strategy_name", "count"),
-                            win_rate=("return_pct", lambda s: float((s > 0).mean())),
-                            avg_return=("return_pct", "mean"),
-                            median_return=("return_pct", "median"),
-                        )
-                        .sort_values(by=["avg_return", "win_rate"], ascending=[False, False])
+                symbol_summary = (
+                    filtered_df.groupby("symbol", as_index=False)
+                    .agg(
+                        trades=("symbol", "count"),
+                        win_rate=("return_pct", lambda s: float((s > 0).mean())),
+                        avg_return=("return_pct", "mean"),
+                        total_return=("return_pct", "sum"),
+                        reco_hit_rate=("reco_hit_rate", "max"),
+                        reco_score=("reco_score", "max"),
+                        reco_label=("reco_label", "first"),
                     )
-                    strategy_summary = strategy_summary.rename(
-                        columns={
-                            "strategy_name": "Strategy",
-                            "win_rate": "Win Rate",
-                            "avg_return": "Avg Return %",
-                            "median_return": "Median Return %",
-                        }
-                    )
-                    st.markdown("#### Strategy Breakdown")
-                    st.dataframe(strategy_summary, use_container_width=True, hide_index=True)
-
-                with d2:
-                    symbol_summary = (
-                        filtered_df.groupby("symbol", as_index=False)
-                        .agg(
-                            trades=("symbol", "count"),
-                            win_rate=("return_pct", lambda s: float((s > 0).mean())),
-                            avg_return=("return_pct", "mean"),
-                            total_return=("return_pct", "sum"),
-                            reco_hit_rate=("reco_hit_rate", "max"),
-                            reco_score=("reco_score", "max"),
-                            reco_label=("reco_label", "first"),
-                        )
-                        .sort_values(by=["total_return", "avg_return"], ascending=[False, False])
-                        .head(30)
-                    )
-                    symbol_summary = symbol_summary.rename(
-                        columns={
-                            "symbol": "Symbol",
-                            "win_rate": "Win Rate",
-                            "avg_return": "Avg Return %",
-                            "total_return": "Total Return %",
-                            "reco_hit_rate": "Reco Hit",
-                            "reco_score": "Reco Score",
-                            "reco_label": "Reco Bias",
-                        }
-                    )
-                    st.markdown("#### Top Symbols")
-                    st.dataframe(symbol_summary, use_container_width=True, hide_index=True)
+                    .sort_values(by=["total_return", "avg_return"], ascending=[False, False])
+                    .head(30)
+                )
+                symbol_summary = symbol_summary.rename(
+                    columns={
+                        "symbol": "Symbol",
+                        "win_rate": "Win Rate",
+                        "avg_return": "Avg Return %",
+                        "total_return": "Total Return %",
+                        "reco_hit_rate": "Reco Hit",
+                        "reco_score": "Reco Score",
+                        "reco_label": "Reco Bias",
+                    }
+                )
+                st.markdown("#### Top Symbols")
+                st.dataframe(symbol_summary, use_container_width=True, hide_index=True)
 
                 st.markdown("#### All Backtested Trades")
                 trade_table = filtered_df.rename(
@@ -1617,7 +1544,6 @@ with tab_backtest:
                     trade_table[
                         [
                             "Symbol",
-                            "Strategy",
                             "Timeframe",
                             "Entry Date",
                             "Exit Date",

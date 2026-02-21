@@ -1035,8 +1035,19 @@ with tab_market:
     # ── Section C: Opportunity Scanner ───────────────────────────────────────
     st.subheader("🔍 Top Opportunities")
     
-    # Get latest metrics (mock data for demo)
+    # Get latest metrics and use only today's refreshed rows.
     metrics_list = get_latest_metrics()
+    today_str = date.today().isoformat()
+    metrics_list_today = []
+    for row in (metrics_list or []):
+        try:
+            row_dict = dict(row) if not isinstance(row, dict) else row
+        except Exception:
+            continue
+        row_date = str(row_dict.get("date", "")).strip()
+        if row_date.startswith(today_str):
+            metrics_list_today.append(row_dict)
+    metrics_list = metrics_list_today
     
     if metrics_list:
         # Score opportunities (defensive: tolerate partial/bad rows)
@@ -1083,7 +1094,7 @@ with tab_market:
         else:
             st.warning("No opportunities found. Refresh metrics.")
     else:
-        st.warning("No metrics available. Refresh data to analyze opportunities.")
+        st.info("Run Refresh Metrics first. Top opportunities display only after today's metrics are generated.")
 
     st.markdown("---")
     st.subheader("🧪 Backtest Report")
@@ -1174,7 +1185,7 @@ with tab_market:
         'strategy_fit': strategy_filter if strategy_filter != 'all' else None
     }
     
-    if metrics_list and st.button("Apply Filters"):
+    if metrics_list and scored and st.button("Apply Filters"):
         from market_intel_engine import apply_filters
         filtered = apply_filters(scored, filters)
         
@@ -1235,12 +1246,35 @@ with tab_portfolio:
     # ── Section B: AI Capital Allocation ─────────────────────────────────────
     st.subheader("🤖 AI Capital Allocation")
     
-    # Get opportunities
+    # Get opportunities and use only today's refreshed rows.
     metrics_list = get_latest_metrics()
-    sentiment = engines['intel'].analyze_market()
+    today_str = date.today().isoformat()
+    metrics_list_today = []
+    for row in (metrics_list or []):
+        try:
+            row_dict = dict(row) if not isinstance(row, dict) else row
+        except Exception:
+            continue
+        row_date = str(row_dict.get("date", "")).strip()
+        if row_date.startswith(today_str):
+            metrics_list_today.append(row_dict)
+    metrics_list = metrics_list_today
     
     if metrics_list:
-        scored = engines['intel'].score_opportunities(metrics_list)
+        sentiment = engines['intel'].analyze_market()
+        scored = []
+        try:
+            cleaned_metrics = []
+            for row in metrics_list:
+                try:
+                    cleaned_metrics.append(dict(row) if not isinstance(row, dict) else row)
+                except Exception:
+                    continue
+            scored = engines['intel'].score_opportunities(cleaned_metrics)
+        except Exception as exc:
+            log.warning("Portfolio opportunity scoring failed on current metrics batch: %s", exc)
+            st.warning("Allocation skipped for invalid metric rows. Refresh metrics and try again.")
+            scored = []
         
         # Run allocator
         allocation = engines['allocator'].allocate(
@@ -1353,7 +1387,7 @@ with tab_portfolio:
                     st.warning("No trades meet quality standards. Market conditions may not be favorable.")
     
     else:
-        st.warning("Load stock data first in Market Intelligence view")
+        st.warning("Run Refresh Metrics first. Allocation and trade selection display only after today's metrics are generated.")
     
     st.markdown("---")
     

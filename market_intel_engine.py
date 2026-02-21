@@ -14,6 +14,20 @@ import logging
 log = logging.getLogger(__name__)
 
 
+def _safe_float(value, default: float) -> float:
+    """Best-effort numeric coercion for partially populated metric rows."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MARKET SENTIMENT DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -176,7 +190,7 @@ def calculate_opportunity_score(stock_metrics: Dict, market_sentiment: Dict = No
     score = 0
     
     # ── Trend Strength (25 points) ────────────────────────────────────────────
-    trend_score = stock_metrics.get('trend_score', 0)
+    trend_score = _safe_float(stock_metrics.get('trend_score', 0), 0.0)
     if trend_score >= 80:
         score += 25
     elif trend_score >= 60:
@@ -187,10 +201,10 @@ def calculate_opportunity_score(stock_metrics: Dict, market_sentiment: Dict = No
         score += 5
     
     # ── Momentum Quality (20 points) ──────────────────────────────────────────
-    rsi = stock_metrics.get('rsi', 50)
-    adx = stock_metrics.get('adx', 0)
-    macd = stock_metrics.get('macd', 0)
-    macd_signal = stock_metrics.get('macd_signal', 0)
+    rsi = _safe_float(stock_metrics.get('rsi', 50), 50.0)
+    adx = _safe_float(stock_metrics.get('adx', 0), 0.0)
+    macd = _safe_float(stock_metrics.get('macd', 0), 0.0)
+    macd_signal = _safe_float(stock_metrics.get('macd_signal', 0), 0.0)
     
     # Ideal: RSI 55-70 (not overbought, strong momentum)
     if 55 <= rsi <= 70:
@@ -211,7 +225,7 @@ def calculate_opportunity_score(stock_metrics: Dict, market_sentiment: Dict = No
         score += 5
     
     # ── Volume Confirmation (15 points) ───────────────────────────────────────
-    volume_ratio = stock_metrics.get('volume_ratio', 1.0)
+    volume_ratio = _safe_float(stock_metrics.get('volume_ratio', 1.0), 1.0)
     if volume_ratio >= 1.5:
         score += 15
     elif volume_ratio >= 1.2:
@@ -220,9 +234,9 @@ def calculate_opportunity_score(stock_metrics: Dict, market_sentiment: Dict = No
         score += 6
     
     # ── Volatility Fit (15 points) ────────────────────────────────────────────
-    bb_width = stock_metrics.get('bb_width', 0)
-    atr = stock_metrics.get('atr', 0)
-    ltp = stock_metrics.get('ltp', 100)
+    bb_width = _safe_float(stock_metrics.get('bb_width', 0), 0.0)
+    atr = _safe_float(stock_metrics.get('atr', 0), 0.0)
+    ltp = _safe_float(stock_metrics.get('ltp', 100), 100.0)
     
     atr_pct = (atr / ltp * 100) if ltp > 0 else 0
     
@@ -235,8 +249,8 @@ def calculate_opportunity_score(stock_metrics: Dict, market_sentiment: Dict = No
         score += 12
     
     # ── ML Prediction (25 points) ─────────────────────────────────────────────
-    win_prob = stock_metrics.get('win_probability', 0.5)
-    expected_return = stock_metrics.get('expected_return', 0)
+    win_prob = _safe_float(stock_metrics.get('win_probability', 0.5), 0.5)
+    expected_return = _safe_float(stock_metrics.get('expected_return', 0), 0.0)
     
     if win_prob >= 0.70:
         score += 18
@@ -308,11 +322,11 @@ def determine_strategy_fit(metrics: Dict) -> str:
     
     Returns: "momentum" | "breakout" | "swing" | "mean_revert" | "none"
     """
-    rsi = metrics.get('rsi', 50)
-    adx = metrics.get('adx', 0)
-    bb_width = metrics.get('bb_width', 0)
-    volume_ratio = metrics.get('volume_ratio', 1.0)
-    trend_score = metrics.get('trend_score', 0)
+    rsi = _safe_float(metrics.get('rsi', 50), 50.0)
+    adx = _safe_float(metrics.get('adx', 0), 0.0)
+    bb_width = _safe_float(metrics.get('bb_width', 0), 0.0)
+    volume_ratio = _safe_float(metrics.get('volume_ratio', 1.0), 1.0)
+    trend_score = _safe_float(metrics.get('trend_score', 0), 0.0)
     
     # bb_width may be represented as ratio (0.02) or percent (2.0).
     bb_width_norm = (bb_width / 100.0) if bb_width > 1 else bb_width

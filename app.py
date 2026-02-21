@@ -751,27 +751,44 @@ with tab_market:
             if max_price < min_price:
                 max_price = min_price
 
-            selected_price_range = st.slider(
-                "Price Range (INR)",
-                min_value=float(min_price),
-                max_value=float(max_price),
-                value=(float(min_price), float(max_price)),
-                step=1.0,
-                help="Only stocks in this range are shown and used in Refresh Metrics/Backtest.",
-            )
-            auto_apply_price_filter = st.checkbox("Auto Apply", value=True)
-            apply_clicked = st.button("Apply", disabled=auto_apply_price_filter)
+            default_start = float(st.session_state.get("price_filter_start", min_price))
+            default_end = float(st.session_state.get("price_filter_end", max_price))
+            default_start = min(max(default_start, min_price), max_price)
+            default_end = min(max(default_end, min_price), max_price)
 
-            if "applied_price_range" not in st.session_state:
-                st.session_state.applied_price_range = selected_price_range
-            if auto_apply_price_filter or apply_clicked:
-                st.session_state.applied_price_range = selected_price_range
+            pcol1, pcol2 = st.columns(2)
+            with pcol1:
+                start_price = st.number_input(
+                    "Start Price (INR)",
+                    min_value=float(min_price),
+                    max_value=float(max_price),
+                    value=float(default_start),
+                    step=1.0,
+                    format="%.2f",
+                    help="Auto-applies on Enter.",
+                    key="price_filter_start_input",
+                )
+            with pcol2:
+                end_price = st.number_input(
+                    "End Price (INR)",
+                    min_value=float(min_price),
+                    max_value=float(max_price),
+                    value=float(default_end),
+                    step=1.0,
+                    format="%.2f",
+                    help="Auto-applies on Enter.",
+                    key="price_filter_end_input",
+                )
 
-            applied_low, applied_high = st.session_state.get("applied_price_range", selected_price_range)
+            if start_price > end_price:
+                start_price, end_price = end_price, start_price
+
+            st.session_state["price_filter_start"] = float(start_price)
+            st.session_state["price_filter_end"] = float(end_price)
+            applied_low, applied_high = float(start_price), float(end_price)
             execution_filtered_df = filter_source_df[
                 filter_source_df["ltp"].between(applied_low, applied_high, inclusive="both")
             ].copy()
-            st.caption(f"Applied: INR {applied_low:,.0f} - INR {applied_high:,.0f}")
         else:
             execution_filtered_df = filter_source_df.copy()
             st.info("Price filter activates after metrics provide LTP values.")
@@ -781,7 +798,7 @@ with tab_market:
             if "symbol" in execution_filtered_df.columns
             else []
         )
-        st.caption(f"Active universe: {len(filtered_symbols)} stocks.")
+        st.caption(f"Filtered stocks: {len(filtered_symbols)}")
     else:
         filtered_symbols = []
         st.info("Load stocks to build universe for refresh and backtest.")

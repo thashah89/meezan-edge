@@ -76,6 +76,13 @@ engines = get_engines()
 
 IST_ZONE = ZoneInfo("Asia/Kolkata")
 UTC_ZONE = ZoneInfo("UTC")
+APP_VERSION = "v3.1.0"
+OPERATION_VERSIONS = {
+    "load_stocks": "1.1.0",
+    "refresh_metrics": "1.3.0",
+    "backtest_ai_boost": "1.2.0",
+    "potential_stock_list": "1.0.0",
+}
 
 
 def _format_utc_to_ist(value) -> str:
@@ -102,6 +109,14 @@ def _format_utc_to_ist(value) -> str:
         return dt.astimezone(IST_ZONE).strftime("%Y-%m-%d %H:%M:%S IST")
     except Exception:
         return raw
+
+
+def _mark_operation_run(op_key: str):
+    op_runs = st.session_state.setdefault("op_runs", {})
+    op_state = op_runs.get(op_key, {"count": 0, "last_run_ist": ""})
+    op_state["count"] = int(op_state.get("count", 0)) + 1
+    op_state["last_run_ist"] = datetime.now(IST_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    op_runs[op_key] = op_state
 
 
 def get_zerodha_client() -> ZerodhaClient:
@@ -662,8 +677,10 @@ with st.sidebar:
     # Universe validity indicator
     try:
         sidebar_active_stocks = get_active_stocks()
-        st.metric("Loaded Stocks", len(sidebar_active_stocks))
+        loaded_count = len(sidebar_active_stocks)
+        st.metric("Loaded Stocks", loaded_count)
         metrics_updated_today = 0
+        filtered_count = 0
         if sidebar_active_stocks:
             sidebar_symbols = [s["symbol"] for s in sidebar_active_stocks if s.get("symbol")]
             if sidebar_symbols:
@@ -680,9 +697,35 @@ with st.sidebar:
                     (date.today().isoformat(), *sidebar_symbols)
                 )
                 row = cursor.fetchone()
-                conn.close()
                 metrics_updated_today = int(row[0]) if row else 0
+                cursor.execute(
+                    f"""
+                    SELECT symbol, ltp
+                    FROM stock_metrics
+                    WHERE date = ?
+                    AND symbol IN ({placeholders})
+                    """,
+                    (date.today().isoformat(), *sidebar_symbols),
+                )
+                rows = cursor.fetchall()
+                conn.close()
+
+                low = st.session_state.get("price_filter_start")
+                high = st.session_state.get("price_filter_end")
+                if low is None or high is None:
+                    filtered_count = len({str(r[0]).upper() for r in rows if r[0]})
+                else:
+                    lo = float(min(low, high))
+                    hi = float(max(low, high))
+                    filtered_symbols = set()
+                    for r in rows:
+                        sym = str(r[0]).upper() if r[0] else ""
+                        ltp = pd.to_numeric(r[1], errors="coerce")
+                        if sym and pd.notna(ltp) and lo <= float(ltp) <= hi:
+                            filtered_symbols.add(sym)
+                    filtered_count = len(filtered_symbols)
         st.metric("Metrics Updated", metrics_updated_today)
+        st.metric("Stocks Filtered", filtered_count, f"of {loaded_count}")
         if sidebar_active_stocks:
             earliest_valid = min(s['valid_till'] for s in sidebar_active_stocks)
             days_left = (datetime.strptime(earliest_valid, "%Y-%m-%d").date() - date.today()).days
@@ -721,8 +764,14 @@ with st.sidebar:
                 st.error(f"Training failed: {e}")
     
     st.markdown("---")
-    st.caption("v3.0 | Profit Maximization Mode")
+    st.caption(f"{APP_VERSION} | Profit Maximization Mode")
     st.caption("Target: 15-25% monthly returns")
+    st.markdown("#### ⚙️ Operation Versions")
+    for op_key, ver in OPERATION_VERSIONS.items():
+        run_state = st.session_state.get("op_runs", {}).get(op_key, {})
+        run_count = int(run_state.get("count", 0))
+        run_last = run_state.get("last_run_ist", "never")
+        st.caption(f"`{op_key}` v{ver} | runs: {run_count} | last: {run_last}")
 
 # Main navigation tabs
 tab_market, tab_portfolio, tab_ai = st.tabs([
@@ -874,6 +923,7 @@ with tab_market:
                 conn.commit()
                 conn.close()
                 
+                _mark_operation_run("load_stocks")
                 st.success(f"✅ Loaded {len(stocks)} stocks")
                 st.rerun()
     
@@ -908,6 +958,7 @@ with tab_market:
                         if hasattr(metrics_result, "inserted_or_updated")
                         else metrics_result.get("updated_symbols", 0)
                     )
+                    _mark_operation_run("refresh_metrics")
                     st.success(f"Updated metrics for {metrics_updated_count} symbols.")
                     st.rerun()
                 except ZerodhaConfigError as exc:
@@ -947,6 +998,7 @@ with tab_market:
                         f"Backtest + AI calibration updated {bt_result['updated_symbols']} symbols"
                         f" (failed: {bt_result['failed_symbols']})."
                     )
+                    _mark_operation_run("backtest_ai_boost")
                     if bt_result.get("strategy_distribution"):
                         dist = ", ".join(
                             [f"{k}: {v}" for k, v in sorted(bt_result["strategy_distribution"].items())]
@@ -1064,8 +1116,8 @@ with tab_market:
     
     st.markdown("---")
     
-    # ── Section C: Opportunity Scanner ───────────────────────────────────────
-    st.subheader("🔍 Top Opportunities")
+    # ── Section C: Potential Stock List ──────────────────────────────────────
+    st.subheader("📌 Potential Stock List")
     
     # Get latest metrics and use only today's refreshed rows.
     metrics_list = get_latest_metrics()
@@ -1096,37 +1148,69 @@ with tab_market:
             log.warning("Opportunity scoring failed on current metrics batch: %s", exc)
             st.warning("Opportunity scoring skipped for some invalid rows. Please refresh metrics.")
         
-        # Display top 20
-        top_20 = scored[:20]
-        
-        if top_20:
-            df_opp = pd.DataFrame(top_20)
-            
-            # Format for display
-            win_prob_series = pd.to_numeric(df_opp.get('win_probability', 0.5), errors='coerce').fillna(0.5)
-            expected_series = pd.to_numeric(df_opp.get('expected_return', 0), errors='coerce').fillna(0.0)
-            rsi_series = pd.to_numeric(df_opp.get('rsi', 50), errors='coerce').fillna(50.0)
-            adx_series = pd.to_numeric(df_opp.get('adx', 0), errors='coerce').fillna(0.0)
-            df_display = pd.DataFrame({
-                'Symbol': df_opp['symbol'],
-                'Score': df_opp['opportunity_score'],
-                'Strategy': df_opp['strategy_fit'].str.title(),
-                'Win Prob': win_prob_series.apply(lambda x: f"{x:.0%}"),
-                'Expected': expected_series.apply(lambda x: f"{x:.1f}%"),
-                'RSI': rsi_series.apply(lambda x: f"{x:.0f}"),
-                'ADX': adx_series.apply(lambda x: f"{x:.0f}"),
-            })
-            
-            st.dataframe(
-                df_display,
-                use_container_width=True,
-                hide_index=True,
-                height=400
+        if scored:
+            df_opp = pd.DataFrame(scored)
+
+            score_s = pd.to_numeric(df_opp.get("opportunity_score", 0), errors="coerce").fillna(0.0)
+            trend_s = pd.to_numeric(df_opp.get("trend_score", 0), errors="coerce").fillna(0.0)
+            rsi_s = pd.to_numeric(df_opp.get("rsi", 50), errors="coerce").fillna(50.0)
+            adx_s = pd.to_numeric(df_opp.get("adx", 0), errors="coerce").fillna(0.0)
+            volume_ratio_s = pd.to_numeric(df_opp.get("volume_ratio", 1.0), errors="coerce").fillna(1.0)
+            bb_width_s = pd.to_numeric(df_opp.get("bb_width", 0), errors="coerce").fillna(0.0)
+            win_prob_s = pd.to_numeric(df_opp.get("win_probability", 0.5), errors="coerce").fillna(0.5)
+            expected_s = pd.to_numeric(df_opp.get("expected_return", 0), errors="coerce").fillna(0.0)
+            strategy_s = df_opp.get("strategy_fit", pd.Series(["none"] * len(df_opp))).astype(str).str.lower()
+
+            breakout_mask = (
+                (strategy_s.str.contains("breakout"))
+                | ((adx_s >= 22) & (volume_ratio_s >= 1.2) & ((bb_width_s <= 0.035) | (score_s >= 75)))
             )
+            reversal_mask = (
+                (strategy_s.str.contains("revert"))
+                | ((rsi_s <= 35) & (adx_s <= 25))
+                | ((rsi_s >= 68) & (adx_s <= 25))
+            )
+            high_potential_mask = (
+                (score_s >= 78) & (trend_s >= 60) & (win_prob_s >= 0.58)
+            )
+
+            df_opp["Potential Setup"] = np.select(
+                [breakout_mask, reversal_mask, high_potential_mask],
+                ["Breakout", "Trend Reversal", "High Potential"],
+                default="Watchlist",
+            )
+
+            potential_df = df_opp[df_opp["Potential Setup"] != "Watchlist"].copy()
+            potential_df = potential_df.sort_values(
+                by=["opportunity_score", "win_probability", "expected_return"],
+                ascending=[False, False, False],
+            ).head(30)
+
+            if not potential_df.empty:
+                st.caption(
+                    "Focus buckets: Breakout, Trend Reversal, and High Potential based on score, trend, momentum, and liquidity."
+                )
+                df_display = pd.DataFrame(
+                    {
+                        "Symbol": potential_df["symbol"],
+                        "Potential Setup": potential_df["Potential Setup"],
+                        "Score": pd.to_numeric(potential_df["opportunity_score"], errors="coerce").fillna(0).round(0).astype(int),
+                        "Strategy": potential_df["strategy_fit"].astype(str).str.title(),
+                        "Win Prob": pd.to_numeric(potential_df["win_probability"], errors="coerce").fillna(0).apply(lambda x: f"{x:.0%}"),
+                        "Expected": pd.to_numeric(potential_df["expected_return"], errors="coerce").fillna(0.0).apply(lambda x: f"{x:.1f}%"),
+                        "RSI": pd.to_numeric(potential_df["rsi"], errors="coerce").fillna(50).round(0).astype(int),
+                        "ADX": pd.to_numeric(potential_df["adx"], errors="coerce").fillna(0).round(0).astype(int),
+                        "LTP": pd.to_numeric(potential_df.get("ltp", 0), errors="coerce").fillna(0.0).apply(lambda x: f"₹{x:,.2f}"),
+                    }
+                )
+
+                st.dataframe(df_display, use_container_width=True, hide_index=True, height=430)
+            else:
+                st.warning("No breakout/reversal/high-potential stocks found in today's refreshed metrics.")
         else:
             st.warning("No opportunities found. Refresh metrics.")
     else:
-        st.info("Run Refresh Metrics first. Top opportunities display only after today's metrics are generated.")
+        st.info("Run Refresh Metrics first. Potential stock list displays only after today's metrics are generated.")
 
     st.markdown("---")
     st.subheader("🧪 Backtest Report")

@@ -669,63 +669,66 @@ with tab_market:
         metrics_df = metrics_df[metrics_df["date"] == date.today().isoformat()]
 
     if not stocks_df.empty and not metrics_df.empty:
+        # Keep full loaded universe visible even when some symbols don't have fresh metrics yet.
         merged_df = stocks_df.merge(metrics_df, on="symbol", how="left", suffixes=("", "_metric"))
-        if "ltp" in merged_df.columns:
-            merged_df = merged_df[merged_df["ltp"].notna()]
         merged_df = merged_df.sort_values(by="symbol").reset_index(drop=True)
+    elif not stocks_df.empty:
+        # Always show loaded universe even before metrics refresh.
+        merged_df = stocks_df.copy().sort_values(by="symbol").reset_index(drop=True)
     else:
         merged_df = pd.DataFrame()
 
-    st.markdown("##### Universe Filter (for Refresh + Backtest)")
+    # Price filter drives both stock table display and Refresh/Backtest universe.
+    execution_filtered_df = pd.DataFrame()
     if not merged_df.empty:
-        numeric_cols = ["ltp", "momentum_score", "volume_ratio", "sma_20", "sma_50", "sma_200"]
-        for col in numeric_cols:
-            if col in merged_df.columns:
-                merged_df[col] = pd.to_numeric(merged_df[col], errors="coerce")
+        filter_source_df = merged_df.copy()
+        if "ltp" in filter_source_df.columns:
+            filter_source_df["ltp"] = pd.to_numeric(filter_source_df["ltp"], errors="coerce")
+            ltp_values = filter_source_df["ltp"].dropna()
+        else:
+            ltp_values = pd.Series(dtype=float)
 
-        fcol1, fcol2 = st.columns(2)
-        with fcol1:
-            min_momentum_score = st.slider(
-                "Min Momentum Score",
-                min_value=0,
-                max_value=100,
-                value=60,
-                step=1,
-                help="Higher value prioritizes stronger momentum setups.",
-            )
-            min_volume_ratio = st.slider(
-                "Min Volume Ratio",
-                min_value=0.5,
-                max_value=5.0,
-                value=1.2,
-                step=0.1,
-                help="Require volume confirmation to back price movement.",
-            )
-        with fcol2:
-            require_uptrend = st.checkbox(
-                "Uptrend Structure Only",
-                value=True,
-                help="Keep stocks where SMA20 > SMA50 > SMA200.",
-            )
+        st.markdown("##### Price Filter (Table + Refresh/Backtest)")
+        if not ltp_values.empty:
+            min_price = float(max(1.0, np.floor(ltp_values.min())))
+            max_price = float(np.ceil(ltp_values.max()))
+            if max_price < min_price:
+                max_price = min_price
 
-        cond = pd.Series(True, index=merged_df.index)
-        if "momentum_score" in merged_df.columns:
-            cond &= merged_df["momentum_score"].fillna(0) >= min_momentum_score
-        if "volume_ratio" in merged_df.columns:
-            cond &= merged_df["volume_ratio"].fillna(0) >= min_volume_ratio
-        if require_uptrend and {"sma_20", "sma_50", "sma_200"}.issubset(merged_df.columns):
-            cond &= (merged_df["sma_20"] > merged_df["sma_50"]) & (merged_df["sma_50"] > merged_df["sma_200"])
+            selected_price_range = st.slider(
+                "Price Range (INR)",
+                min_value=float(min_price),
+                max_value=float(max_price),
+                value=(float(min_price), float(max_price)),
+                step=1.0,
+                help="Only stocks in this range are shown and used in Refresh Metrics/Backtest.",
+            )
+            auto_apply_price_filter = st.checkbox("Auto Apply", value=True)
+            apply_clicked = st.button("Apply", disabled=auto_apply_price_filter)
 
-        merged_df_filtered = merged_df[cond].copy()
+            if "applied_price_range" not in st.session_state:
+                st.session_state.applied_price_range = selected_price_range
+            if auto_apply_price_filter or apply_clicked:
+                st.session_state.applied_price_range = selected_price_range
+
+            applied_low, applied_high = st.session_state.get("applied_price_range", selected_price_range)
+            execution_filtered_df = filter_source_df[
+                filter_source_df["ltp"].between(applied_low, applied_high, inclusive="both")
+            ].copy()
+            st.caption(f"Applied: INR {applied_low:,.0f} - INR {applied_high:,.0f}")
+        else:
+            execution_filtered_df = filter_source_df.copy()
+            st.info("Price filter activates after metrics provide LTP values.")
+
         filtered_symbols = (
-            merged_df_filtered["symbol"].dropna().astype(str).str.upper().unique().tolist()
-            if "symbol" in merged_df_filtered.columns
+            execution_filtered_df["symbol"].dropna().astype(str).str.upper().unique().tolist()
+            if "symbol" in execution_filtered_df.columns
             else []
         )
-        st.caption(f"Using {len(filtered_symbols)} of {len(merged_df)} stocks for Refresh/Backtest.")
+        st.caption(f"Active universe: {len(filtered_symbols)} stocks.")
     else:
-        merged_df_filtered = pd.DataFrame()
-        st.info("Run Refresh Metrics once to enable price/momentum/volume filtering.")
+        filtered_symbols = []
+        st.info("Load stocks to build universe for refresh and backtest.")
 
     col1, col2, col3 = st.columns(3)
     
@@ -841,32 +844,7 @@ with tab_market:
         if merged_df.empty:
             st.info("No successful metric rows to display yet. Click Refresh Metrics.")
         else:
-            # Separate display-only price filter (not part of universe refresh/backtest filter).
-            table_df_source = merged_df.copy()
-            if "ltp" in table_df_source.columns:
-                table_df_source["ltp"] = pd.to_numeric(table_df_source["ltp"], errors="coerce")
-                table_price_vals = table_df_source["ltp"].dropna()
-                if not table_price_vals.empty:
-                    table_min_price = float(max(1.0, np.floor(table_price_vals.min())))
-                    table_max_price = float(np.ceil(table_price_vals.max()))
-                    if table_max_price < table_min_price:
-                        table_max_price = table_min_price
-                    table_default_low = 100.0 if table_max_price >= 100 else table_min_price
-                    table_default_high = table_max_price
-                    if table_default_low > table_default_high:
-                        table_default_low = table_min_price
-
-                    table_price_range = st.slider(
-                        "Price Filter for Table (INR)",
-                        min_value=float(table_min_price),
-                        max_value=float(table_max_price),
-                        value=(float(table_default_low), float(table_default_high)),
-                        step=1.0,
-                        help="Display-only filter. Does not change refresh/backtest universe.",
-                    )
-                    table_df_source = table_df_source[
-                        table_df_source["ltp"].between(table_price_range[0], table_price_range[1], inclusive="both")
-                    ]
+            table_df_source = execution_filtered_df.copy() if not execution_filtered_df.empty else merged_df.copy()
 
             if table_df_source.empty:
                 st.info("No stocks in selected price range.")

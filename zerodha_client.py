@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 import pandas as pd
 import numpy as np
@@ -641,6 +641,7 @@ class ZerodhaClient:
             name: {"trades": 0, "wins": 0, "sum_return": 0.0}
             for name in strategy_rules.keys()
         }
+        run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         timeframe_coverage: Dict[str, int] = {}
 
         instrument_token_by_symbol: Dict[str, int] = {}
@@ -718,7 +719,14 @@ class ZerodhaClient:
                             if ind_df.empty or len(ind_df) < 80:
                                 continue
 
-                            backtest_tf = self._backtest_strategies(ind_df, hold_days=interval_hold)
+                            backtest_out = self._backtest_strategies(
+                                ind_df,
+                                hold_days=interval_hold,
+                                symbol=symbol,
+                                timeframe=interval,
+                            )
+                            backtest_tf = backtest_out.get("stats", {})
+                            self._persist_backtest_trades(cur, run_id, backtest_out.get("trades", []))
                             for s_name, s_data in backtest_tf.items():
                                 combined_backtest[s_name]["trades"] += int(s_data["trades"] * weight)
                                 combined_backtest[s_name]["wins"] += int(s_data["wins"] * weight)
@@ -836,6 +844,7 @@ class ZerodhaClient:
             conn.close()
 
         return {
+            "run_id": run_id,
             "updated_symbols": updated_symbols,
             "failed_symbols": failed_symbols,
             "failures": failures,
@@ -1191,16 +1200,26 @@ class ZerodhaClient:
         ai_profit = float(self.predictor.predict_profit(feat))
         return ai_win, ai_profit
 
-    def _backtest_strategies(self, ind_df: pd.DataFrame, hold_days: int = 5) -> Dict[str, Dict]:
+    def _backtest_strategies(
+        self,
+        ind_df: pd.DataFrame,
+        hold_days: int = 5,
+        symbol: str = "",
+        timeframe: str = "day",
+    ) -> Dict[str, Any]:
         rules = self._strategy_rules()
         stats = {
             name: {"trades": 0, "wins": 0, "sum_return": 0.0}
             for name in rules.keys()
         }
+        trades_log: List[Dict[str, Any]] = []
         daily_once_strategies = {"opening_range_breakout"}
         traded_days: Dict[str, set] = {name: set() for name in rules.keys()}
         if ind_df.empty or len(ind_df) <= hold_days + 60:
-            return {k: {"trades": 0, "wins": 0, "win_rate": 0.5, "avg_return": 0.0, "sum_return": 0.0} for k in stats}
+            return {
+                "stats": {k: {"trades": 0, "wins": 0, "win_rate": 0.5, "avg_return": 0.0, "sum_return": 0.0} for k in stats},
+                "trades": [],
+            }
 
         for i in range(60, len(ind_df) - hold_days):
             row = ind_df.iloc[i]
@@ -1214,16 +1233,33 @@ class ZerodhaClient:
                 if strat in daily_once_strategies and day_key in traded_days.get(strat, set()):
                     continue
                 if self._strategy_signal(row, strat):
-                    ret_pct = self._simulate_trade_return(
+                    trade_result = self._simulate_trade_return(
                         ind_df=ind_df,
                         entry_idx=i,
                         hold_days=hold_days,
                         strategy=strat,
                     )
+                    ret_pct = float(trade_result.get("return_pct", 0.0))
                     stats[strat]["trades"] += 1
                     stats[strat]["sum_return"] += ret_pct
                     if ret_pct > 0:
                         stats[strat]["wins"] += 1
+                    trades_log.append(
+                        {
+                            "symbol": symbol,
+                            "strategy_name": strat,
+                            "timeframe": timeframe,
+                            "entry_date": trade_result.get("entry_date"),
+                            "exit_date": trade_result.get("exit_date"),
+                            "holding_bars": int(trade_result.get("holding_bars", 0)),
+                            "entry_price": float(trade_result.get("entry_price", 0.0)),
+                            "exit_price": float(trade_result.get("exit_price", 0.0)),
+                            "stop_loss": float(trade_result.get("stop_loss", 0.0)),
+                            "target_price": float(trade_result.get("target_price", 0.0)),
+                            "return_pct": ret_pct,
+                            "outcome": trade_result.get("outcome", "flat"),
+                        }
+                    )
                     if strat in daily_once_strategies:
                         traded_days[strat].add(day_key)
 
@@ -1240,7 +1276,7 @@ class ZerodhaClient:
                 "avg_return": float(avg_return),
                 "sum_return": float(agg["sum_return"]),
             }
-        return out
+        return {"stats": out, "trades": trades_log}
 
     @classmethod
     def _simulate_trade_return(
@@ -1249,14 +1285,24 @@ class ZerodhaClient:
         entry_idx: int,
         hold_days: int,
         strategy: str,
-    ) -> float:
+    ) -> Dict[str, Any]:
         """
         Simulate return using stop/target intraperiod checks instead of only fixed close exit.
         """
         row = ind_df.iloc[entry_idx]
         entry = cls._safe_float(row.get("close"), 0.0)
         if entry <= 0:
-            return 0.0
+            return {
+                "return_pct": 0.0,
+                "entry_price": 0.0,
+                "exit_price": 0.0,
+                "stop_loss": 0.0,
+                "target_price": 0.0,
+                "entry_date": None,
+                "exit_date": None,
+                "holding_bars": 0,
+                "outcome": "flat",
+            }
 
         atr = max(0.01, cls._safe_float(row.get("ATR"), entry * 0.01))
         if strategy in {"breakout", "volatility_squeeze", "range_breakout"}:
@@ -1270,6 +1316,7 @@ class ZerodhaClient:
         target = entry + (atr * tgt_mult)
 
         end_idx = min(len(ind_df) - 1, entry_idx + hold_days)
+        actual_exit_idx = end_idx
         exit_price = cls._safe_float(ind_df.iloc[end_idx].get("close"), entry)
 
         for j in range(entry_idx + 1, end_idx + 1):
@@ -1286,14 +1333,18 @@ class ZerodhaClient:
             # assuming stop-loss first (which is overly pessimistic).
             if hit_stop and hit_target:
                 exit_price = target if close_px >= open_px else stop
+                actual_exit_idx = j
                 break
             if hit_target:
                 exit_price = target
+                actual_exit_idx = j
                 break
             if hit_stop:
                 exit_price = stop
+                actual_exit_idx = j
                 break
             exit_price = cls._safe_float(rj.get("close"), exit_price)
+            actual_exit_idx = j
 
         gross_ret = ((exit_price - entry) / entry) * 100.0
         # Strategy-aware round-trip friction (%) tuned for paper backtest realism.
@@ -1323,7 +1374,26 @@ class ZerodhaClient:
             "prev_day_hl_break": 0.09,
         }
         trading_cost = trading_cost_by_strategy.get(strategy, 0.10)
-        return gross_ret - trading_cost
+        net_return = gross_ret - trading_cost
+        entry_dt = pd.to_datetime(row.get("date"), errors="coerce")
+        exit_dt = pd.to_datetime(ind_df.iloc[actual_exit_idx].get("date"), errors="coerce")
+        if net_return > 0:
+            outcome = "win"
+        elif net_return < 0:
+            outcome = "loss"
+        else:
+            outcome = "flat"
+        return {
+            "return_pct": float(net_return),
+            "entry_price": float(entry),
+            "exit_price": float(exit_price),
+            "stop_loss": float(stop),
+            "target_price": float(target),
+            "entry_date": entry_dt.date().isoformat() if pd.notna(entry_dt) else None,
+            "exit_date": exit_dt.date().isoformat() if pd.notna(exit_dt) else None,
+            "holding_bars": int(max(1, actual_exit_idx - entry_idx)),
+            "outcome": outcome,
+        }
 
     @classmethod
     def _strategy_signal(cls, row, strategy: str) -> bool:
@@ -1675,6 +1745,44 @@ class ZerodhaClient:
                     1,
                 ),
             )
+
+    @staticmethod
+    def _persist_backtest_trades(cur, run_id: str, trades: List[Dict[str, Any]]):
+        if not trades:
+            return
+        rows = []
+        for t in trades:
+            if not t.get("symbol") or not t.get("strategy_name"):
+                continue
+            rows.append(
+                (
+                    run_id,
+                    str(t.get("symbol", "")).upper(),
+                    str(t.get("strategy_name", "")),
+                    str(t.get("timeframe", "day")),
+                    t.get("entry_date"),
+                    t.get("exit_date"),
+                    int(t.get("holding_bars", 0)),
+                    float(t.get("entry_price", 0.0)),
+                    float(t.get("exit_price", 0.0)),
+                    float(t.get("stop_loss", 0.0)),
+                    float(t.get("target_price", 0.0)),
+                    float(t.get("return_pct", 0.0)),
+                    str(t.get("outcome", "flat")),
+                )
+            )
+        if not rows:
+            return
+        cur.executemany(
+            """
+            INSERT INTO backtest_trades (
+                run_id, symbol, strategy_name, timeframe, entry_date, exit_date,
+                holding_bars, entry_price, exit_price, stop_loss, target_price, return_pct, outcome
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
     @staticmethod
     def _build_instrument_resolution_maps(instruments: List[Dict]) -> Tuple[Dict[str, int], Dict[str, str]]:

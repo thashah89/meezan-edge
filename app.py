@@ -775,8 +775,9 @@ with st.sidebar:
         st.caption(f"`{op_key}` v{ver} | runs: {run_count} | last: {run_last}")
 
 # Main navigation tabs
-tab_market, tab_portfolio, tab_ai = st.tabs([
+tab_market, tab_backtest, tab_portfolio, tab_ai = st.tabs([
     "🔍 Market Intelligence",
+    "📊 Backtest Review",
     "💼 Portfolio Engine",
     "🤖 AI Lab",
 ])
@@ -1369,6 +1370,213 @@ with tab_market:
 #  VIEW 2: AUTONOMOUS PORTFOLIO ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# Backtest Review tab
+with tab_backtest:
+    st.markdown("<h1 class='main-header'>Backtest Review</h1>", unsafe_allow_html=True)
+    st.markdown("**Detailed trade-level analysis for strategy validation and improvement**")
+    st.markdown("---")
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                run_id,
+                COUNT(*) AS trades,
+                SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins,
+                AVG(return_pct) AS avg_return,
+                MAX(created_at) AS updated_at
+            FROM backtest_trades
+            GROUP BY run_id
+            ORDER BY MAX(created_at) DESC
+            LIMIT 20
+            """
+        )
+        run_rows = cursor.fetchall()
+
+        if not run_rows:
+            conn.close()
+            st.info("No detailed backtest run found yet. Run 'Backtest + AI Boost' first.")
+        else:
+            runs_df = pd.DataFrame([dict(r) for r in run_rows])
+            runs_df["updated_at_ist"] = runs_df["updated_at"].apply(_format_utc_to_ist)
+            runs_df["wins"] = pd.to_numeric(runs_df["wins"], errors="coerce").fillna(0).astype(int)
+            runs_df["trades"] = pd.to_numeric(runs_df["trades"], errors="coerce").fillna(0).astype(int)
+            runs_df["win_rate"] = np.where(runs_df["trades"] > 0, runs_df["wins"] / runs_df["trades"], 0.0)
+
+            run_options = [
+                f"{row.run_id} | {row.updated_at_ist} | trades: {int(row.trades)} | win: {row.win_rate:.1%}"
+                for row in runs_df.itertuples(index=False)
+            ]
+            selected_run_label = st.selectbox("Backtest Run", run_options, index=0)
+            selected_run_id = selected_run_label.split(" | ", 1)[0]
+
+            cursor.execute(
+                """
+                SELECT
+                    symbol,
+                    strategy_name,
+                    timeframe,
+                    entry_date,
+                    exit_date,
+                    holding_bars,
+                    entry_price,
+                    exit_price,
+                    stop_loss,
+                    target_price,
+                    return_pct,
+                    outcome,
+                    created_at
+                FROM backtest_trades
+                WHERE run_id = ?
+                ORDER BY entry_date DESC, symbol ASC
+                """,
+                (selected_run_id,),
+            )
+            trade_rows = cursor.fetchall()
+            conn.close()
+
+            if not trade_rows:
+                st.info("No trades found for selected run.")
+            else:
+                trades_df = pd.DataFrame([dict(r) for r in trade_rows])
+                trades_df["return_pct"] = pd.to_numeric(trades_df["return_pct"], errors="coerce").fillna(0.0)
+                trades_df["holding_bars"] = pd.to_numeric(trades_df["holding_bars"], errors="coerce").fillna(0).astype(int)
+                trades_df["created_at_ist"] = trades_df["created_at"].apply(_format_utc_to_ist)
+
+                strategy_options = sorted(trades_df["strategy_name"].dropna().astype(str).unique().tolist())
+                timeframe_options = sorted(trades_df["timeframe"].dropna().astype(str).unique().tolist())
+                outcome_options = sorted(trades_df["outcome"].dropna().astype(str).unique().tolist())
+
+                f1, f2, f3 = st.columns(3)
+                with f1:
+                    selected_strategies = st.multiselect("Strategy Filter", strategy_options, default=strategy_options)
+                with f2:
+                    selected_timeframes = st.multiselect("Timeframe Filter", timeframe_options, default=timeframe_options)
+                with f3:
+                    selected_outcomes = st.multiselect("Outcome Filter", outcome_options, default=outcome_options)
+
+                filtered_df = trades_df[
+                    trades_df["strategy_name"].isin(selected_strategies)
+                    & trades_df["timeframe"].isin(selected_timeframes)
+                    & trades_df["outcome"].isin(selected_outcomes)
+                ].copy()
+
+                total_trades = len(filtered_df)
+                wins = int((filtered_df["return_pct"] > 0).sum())
+                losses = int((filtered_df["return_pct"] < 0).sum())
+                win_rate = (wins / total_trades) if total_trades else 0.0
+                avg_return = float(filtered_df["return_pct"].mean()) if total_trades else 0.0
+                gross_profit = float(filtered_df.loc[filtered_df["return_pct"] > 0, "return_pct"].sum())
+                gross_loss = float(filtered_df.loc[filtered_df["return_pct"] < 0, "return_pct"].sum())
+                profit_factor = (gross_profit / abs(gross_loss)) if gross_loss < 0 else 0.0
+                avg_win = float(filtered_df.loc[filtered_df["return_pct"] > 0, "return_pct"].mean()) if wins else 0.0
+                avg_loss = float(filtered_df.loc[filtered_df["return_pct"] < 0, "return_pct"].mean()) if losses else 0.0
+                expectancy = (win_rate * avg_win) + ((1.0 - win_rate) * avg_loss)
+
+                k1, k2, k3, k4, k5 = st.columns(5)
+                k1.metric("Trades", f"{total_trades}")
+                k2.metric("Win Rate", f"{win_rate:.1%}")
+                k3.metric("Avg Return", f"{avg_return:.2f}%")
+                k4.metric("Expectancy", f"{expectancy:.2f}%")
+                k5.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor > 0 else "n/a")
+
+                d1, d2 = st.columns(2)
+                with d1:
+                    strategy_summary = (
+                        filtered_df.groupby("strategy_name", as_index=False)
+                        .agg(
+                            trades=("strategy_name", "count"),
+                            win_rate=("return_pct", lambda s: float((s > 0).mean())),
+                            avg_return=("return_pct", "mean"),
+                            median_return=("return_pct", "median"),
+                        )
+                        .sort_values(by=["avg_return", "win_rate"], ascending=[False, False])
+                    )
+                    strategy_summary = strategy_summary.rename(
+                        columns={
+                            "strategy_name": "Strategy",
+                            "win_rate": "Win Rate",
+                            "avg_return": "Avg Return %",
+                            "median_return": "Median Return %",
+                        }
+                    )
+                    st.markdown("#### Strategy Breakdown")
+                    st.dataframe(strategy_summary, use_container_width=True, hide_index=True)
+
+                with d2:
+                    symbol_summary = (
+                        filtered_df.groupby("symbol", as_index=False)
+                        .agg(
+                            trades=("symbol", "count"),
+                            win_rate=("return_pct", lambda s: float((s > 0).mean())),
+                            avg_return=("return_pct", "mean"),
+                            total_return=("return_pct", "sum"),
+                        )
+                        .sort_values(by=["total_return", "avg_return"], ascending=[False, False])
+                        .head(30)
+                    )
+                    symbol_summary = symbol_summary.rename(
+                        columns={
+                            "symbol": "Symbol",
+                            "win_rate": "Win Rate",
+                            "avg_return": "Avg Return %",
+                            "total_return": "Total Return %",
+                        }
+                    )
+                    st.markdown("#### Top Symbols")
+                    st.dataframe(symbol_summary, use_container_width=True, hide_index=True)
+
+                st.markdown("#### All Backtested Trades")
+                trade_table = filtered_df.rename(
+                    columns={
+                        "symbol": "Symbol",
+                        "strategy_name": "Strategy",
+                        "timeframe": "Timeframe",
+                        "entry_date": "Entry Date",
+                        "exit_date": "Exit Date",
+                        "holding_bars": "Holding Bars",
+                        "entry_price": "Entry",
+                        "exit_price": "Exit",
+                        "stop_loss": "Stop",
+                        "target_price": "Target",
+                        "return_pct": "Return %",
+                        "outcome": "Outcome",
+                        "created_at_ist": "Updated At (IST)",
+                    }
+                )
+                for price_col in ["Entry", "Exit", "Stop", "Target"]:
+                    if price_col in trade_table.columns:
+                        trade_table[price_col] = pd.to_numeric(trade_table[price_col], errors="coerce").fillna(0.0).round(2)
+                if "Return %" in trade_table.columns:
+                    trade_table["Return %"] = pd.to_numeric(trade_table["Return %"], errors="coerce").fillna(0.0).round(2)
+
+                st.dataframe(
+                    trade_table[
+                        [
+                            "Symbol",
+                            "Strategy",
+                            "Timeframe",
+                            "Entry Date",
+                            "Exit Date",
+                            "Holding Bars",
+                            "Entry",
+                            "Exit",
+                            "Stop",
+                            "Target",
+                            "Return %",
+                            "Outcome",
+                            "Updated At (IST)",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=520,
+                )
+    except Exception as exc:
+        st.warning(f"Backtest review unavailable: {exc}")
 with tab_portfolio:
     st.markdown("<h1 class='main-header'>💼 Autonomous Portfolio Engine</h1>", unsafe_allow_html=True)
     st.markdown("**AI-driven capital management and trade execution**")
@@ -2025,4 +2233,5 @@ with tab_ai:
 st.markdown("---")
 st.caption("🧠 Meezan Edge v3.0 — Autonomous Halal Hedge Fund System | Profit Maximization Mode")
 st.caption("⚠️ PAPER TRADING ONLY — No real capital deployment")
+
 

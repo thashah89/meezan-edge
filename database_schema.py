@@ -197,6 +197,26 @@ TABLES = {
             UNIQUE(strategy_name, period_start)
         )
     """,
+
+    "backtest_trades": """
+        CREATE TABLE IF NOT EXISTS backtest_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            strategy_name TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            entry_date DATE,
+            exit_date DATE,
+            holding_bars INTEGER,
+            entry_price REAL,
+            exit_price REAL,
+            stop_loss REAL,
+            target_price REAL,
+            return_pct REAL,
+            outcome TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
     
     "ai_model_logs": """
         CREATE TABLE IF NOT EXISTS ai_model_logs (
@@ -248,6 +268,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_trades_status ON trades_simulated(status)",
     "CREATE INDEX IF NOT EXISTS idx_trades_entry_date ON trades_simulated(entry_date DESC)",
     "CREATE INDEX IF NOT EXISTS idx_portfolio_date ON portfolio_daily(date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_backtest_trades_strategy ON backtest_trades(strategy_name)",
+    "CREATE INDEX IF NOT EXISTS idx_backtest_trades_symbol ON backtest_trades(symbol)",
 ]
 
 
@@ -388,6 +411,27 @@ def _run_compat_migrations(cursor):
             win_rate REAL,
             avg_return REAL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Ensure backtest_trades exists for detailed strategy diagnostics.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            strategy_name TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            entry_date DATE,
+            exit_date DATE,
+            holding_bars INTEGER,
+            entry_price REAL,
+            exit_price REAL,
+            stop_loss REAL,
+            target_price REAL,
+            return_pct REAL,
+            outcome TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 

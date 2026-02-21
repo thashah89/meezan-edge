@@ -261,6 +261,130 @@ class ZerodhaClient:
 
         return RefreshResult(inserted_or_updated=updated, failed=failed, failures=failures)
 
+    def refresh_ltp_snapshot(
+        self,
+        symbols: List[str],
+        progress_cb: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> RefreshResult:
+        """
+        Fast startup refresh that only updates OHLCV/LTP snapshot for today's row.
+        Keeps existing indicator/model columns intact via ON CONFLICT UPDATE.
+        """
+        if not self.is_authenticated:
+            raise ZerodhaConfigError("Zerodha access token is missing. Authenticate first.")
+        if not symbols:
+            return RefreshResult(inserted_or_updated=0, failed=0, failures=[])
+
+        today = date.today().isoformat()
+        instrument_token_by_symbol: Dict[str, int] = {}
+        alias_to_tradingsymbol: Dict[str, str] = {}
+        resolved_by_input: Dict[str, str] = {}
+        failures: List[Tuple[str, str]] = []
+
+        try:
+            instruments = self.kite.instruments("NSE")
+            instrument_token_by_symbol, alias_to_tradingsymbol = self._build_instrument_resolution_maps(instruments)
+            for raw_symbol in symbols:
+                base_symbol = self.normalize_symbol(raw_symbol)
+                resolved = self._resolve_to_tradingsymbol(
+                    base_symbol,
+                    instrument_token_by_symbol,
+                    alias_to_tradingsymbol,
+                )
+                if resolved:
+                    resolved_by_input[base_symbol] = resolved
+        except Exception as exc:
+            raise RuntimeError(f"Could not load NSE instruments: {exc}") from exc
+
+        resolved_universe = list({v for v in resolved_by_input.values() if v})
+        quotes = self.fetch_quotes(resolved_universe) if resolved_universe else {}
+
+        conn = get_connection()
+        cur = conn.cursor()
+        updated = 0
+        failed = 0
+        total = len(symbols)
+        processed = 0
+
+        try:
+            for raw_symbol in symbols:
+                symbol = self.normalize_symbol(raw_symbol)
+                status = "updated"
+                if not symbol:
+                    failed += 1
+                    failures.append((str(raw_symbol), "Invalid symbol"))
+                    status = "invalid"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, str(raw_symbol), status)
+                    continue
+
+                resolved_symbol = resolved_by_input.get(symbol, "")
+                if not resolved_symbol:
+                    failed += 1
+                    failures.append((symbol, "Instrument token not found"))
+                    status = "failed"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, symbol, status)
+                    continue
+
+                q = quotes.get(resolved_symbol)
+                if not q:
+                    failed += 1
+                    failures.append((symbol, "No quote received"))
+                    status = "failed"
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed, total, symbol, status)
+                    continue
+
+                try:
+                    row = self._quote_to_metrics_row(symbol, q)
+                    cur.execute(
+                        """
+                        INSERT INTO stock_metrics
+                        (symbol, date, ltp, open, high, low, close, volume, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(symbol, date) DO UPDATE SET
+                            ltp = excluded.ltp,
+                            open = excluded.open,
+                            high = excluded.high,
+                            low = excluded.low,
+                            close = excluded.close,
+                            volume = excluded.volume,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            symbol,
+                            today,
+                            row["ltp"],
+                            row["open"],
+                            row["high"],
+                            row["low"],
+                            row["close"],
+                            row["volume"],
+                        ),
+                    )
+                    updated += 1
+                except Exception as exc:
+                    failed += 1
+                    failures.append((symbol, str(exc)))
+                    status = "failed"
+
+                processed += 1
+                if progress_cb:
+                    progress_cb(processed, total, symbol, status)
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return RefreshResult(inserted_or_updated=updated, failed=failed, failures=failures)
+
     def refresh_sector_buckets(self, symbols: List[str]) -> Tuple[int, int]:
         """
         Refresh sector buckets for loaded symbols using Zerodha instruments.

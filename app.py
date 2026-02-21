@@ -308,6 +308,51 @@ def _refresh_metrics_with_backtest(symbols: list[str], progress_bar):
     return metrics_result, bt_result
 
 
+def _auto_sync_startup_ltp():
+    """
+    Startup fast-path: sync latest LTP for loaded stocks after authentication.
+    This powers price filtering without running full metrics/backtest.
+    """
+    active_stocks = get_active_stocks()
+    symbols = [str(s.get("symbol", "")).strip().upper() for s in active_stocks if s.get("symbol")]
+    symbols = [s for s in symbols if s]
+    if not symbols:
+        st.session_state["startup_ltp_sync_status"] = ("idle", "No loaded stocks yet.")
+        return
+
+    today_key = date.today().isoformat()
+    if st.session_state.get("startup_ltp_sync_date") == today_key:
+        return
+
+    try:
+        z_client = get_zerodha_client()
+        if not z_client.is_authenticated:
+            st.session_state["startup_ltp_sync_status"] = (
+                "needs_auth",
+                "Authenticate Zerodha to auto-load latest prices for loaded stocks.",
+            )
+            return
+
+        result = z_client.refresh_ltp_snapshot(symbols)
+        st.session_state["startup_ltp_sync_date"] = today_key
+        st.session_state["startup_ltp_sync_status"] = (
+            "ok",
+            f"Startup LTP sync: {result.inserted_or_updated} updated, {result.failed} failed.",
+        )
+    except ZerodhaConfigError as exc:
+        st.session_state["startup_ltp_sync_status"] = ("config_error", str(exc))
+    except Exception as exc:
+        if _is_zerodha_auth_error(exc):
+            _clear_persisted_zerodha_token()
+            st.session_state.pop("zerodha_access_token", None)
+            st.session_state["startup_ltp_sync_status"] = (
+                "needs_auth",
+                "Session expired. Re-authenticate Zerodha to auto-load prices.",
+            )
+        else:
+            st.session_state["startup_ltp_sync_status"] = ("error", f"Startup LTP sync failed: {exc}")
+
+
 def _is_live_market_hours(now_ist: datetime | None = None) -> bool:
     """
     NSE cash market hours (IST): Mon-Fri, 09:15 to 15:30.
@@ -470,6 +515,7 @@ def _bootstrap_stock_universe_if_empty():
 
 
 _bootstrap_stock_universe_if_empty()
+_auto_sync_startup_ltp()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CUSTOM CSS
@@ -531,6 +577,16 @@ with st.sidebar:
     except ZerodhaConfigError as exc:
         st.warning("Zerodha not configured")
         st.caption(str(exc))
+
+    startup_ltp_status = st.session_state.get("startup_ltp_sync_status")
+    if startup_ltp_status:
+        status_code, status_msg = startup_ltp_status
+        if status_code == "needs_auth":
+            st.warning(status_msg)
+        elif status_code == "ok":
+            st.caption(status_msg)
+        elif status_code in ("config_error", "error"):
+            st.caption(status_msg)
 
     st.markdown("---")
     

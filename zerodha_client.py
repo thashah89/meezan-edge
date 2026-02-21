@@ -366,6 +366,9 @@ class ZerodhaClient:
         processed = 0
 
         try:
+            # Keep report snapshot fresh for each run and avoid stale rows in UI.
+            cur.execute("DELETE FROM strategy_performance")
+
             for raw_symbol in symbols:
                 symbol = self.normalize_symbol(raw_symbol)
                 status = "updated"

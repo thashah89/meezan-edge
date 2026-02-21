@@ -196,6 +196,43 @@ def _run_backend_training():
         log.warning("Background retrain skipped: %s", exc)
 
 
+def _refresh_metrics_with_backtest(symbols: list[str], progress_bar):
+    """
+    Refresh metrics and immediately run backtest calibration so strategy report
+    reflects the latest metrics in the same run.
+    """
+    z_client = get_zerodha_client()
+
+    def _on_metrics_progress(done: int, total: int, sym: str, status: str):
+        ratio = 0.0 if total <= 0 else done / total
+        progress_bar.progress(
+            min(0.65, ratio * 0.65),
+            text=f"Refreshing metrics {done}/{total}: {sym} ({status})",
+        )
+
+    metrics_result = z_client.refresh_latest_metrics(symbols, progress_cb=_on_metrics_progress)
+    progress_bar.progress(0.70, text="Refreshing sector buckets...")
+    z_client.refresh_sector_buckets(symbols)
+
+    def _on_backtest_progress(done: int, total: int, sym: str, status: str):
+        ratio = 0.0 if total <= 0 else done / total
+        progress_bar.progress(
+            min(0.99, 0.70 + (ratio * 0.29)),
+            text=f"Backtesting {done}/{total}: {sym} ({status})",
+        )
+
+    bt_result = z_client.run_backtest_ai_calibration(
+        symbols=symbols,
+        lookback_days=260,
+        hold_days=5,
+        progress_cb=_on_backtest_progress,
+    )
+
+    progress_bar.progress(1.0, text="Refresh + backtest complete.")
+    threading.Thread(target=_run_backend_training, daemon=True).start()
+    return metrics_result, bt_result
+
+
 def _is_live_market_hours(now_ist: datetime | None = None) -> bool:
     """
     NSE cash market hours (IST): Mon-Fri, 09:15 to 15:30.
@@ -500,7 +537,10 @@ with st.sidebar:
     
     # Quick actions
     st.markdown("### ⚡ Quick Actions")
-    
+
+    if st.button("🔄 Refresh Numbers", use_container_width=True):
+        st.rerun()
+
     if st.button("🔄 Refresh All Data", use_container_width=True):
         st.cache_data.clear()
         st.cache_resource.clear()
@@ -541,6 +581,100 @@ with tab_market:
     
     active_stocks = get_active_stocks()
     symbols = [s["symbol"] for s in active_stocks]
+    filtered_symbols = symbols
+
+    stocks_df = pd.DataFrame(active_stocks) if active_stocks else pd.DataFrame()
+    if not stocks_df.empty:
+        stocks_df = stocks_df[[c for c in stocks_df.columns if c not in ("load_date", "valid_till")]]
+
+    latest_metrics_for_table = get_latest_metrics()
+    metrics_df = pd.DataFrame(latest_metrics_for_table) if latest_metrics_for_table else pd.DataFrame()
+    if not metrics_df.empty and "date" in metrics_df.columns:
+        metrics_df = metrics_df[metrics_df["date"] == date.today().isoformat()]
+
+    if not stocks_df.empty and not metrics_df.empty:
+        merged_df = stocks_df.merge(metrics_df, on="symbol", how="left", suffixes=("", "_metric"))
+        if "ltp" in merged_df.columns:
+            merged_df = merged_df[merged_df["ltp"].notna()]
+        merged_df = merged_df.sort_values(by="symbol").reset_index(drop=True)
+    else:
+        merged_df = pd.DataFrame()
+
+    st.markdown("##### Universe Filter (for Refresh + Backtest)")
+    if not merged_df.empty:
+        numeric_cols = ["ltp", "momentum_score", "volume_ratio", "sma_20", "sma_50", "sma_200"]
+        for col in numeric_cols:
+            if col in merged_df.columns:
+                merged_df[col] = pd.to_numeric(merged_df[col], errors="coerce")
+
+        price_vals = merged_df["ltp"].dropna() if "ltp" in merged_df.columns else pd.Series(dtype=float)
+        if not price_vals.empty:
+            min_price_data = float(max(1.0, np.floor(price_vals.min())))
+            max_price_data = float(np.ceil(price_vals.max()))
+            if max_price_data < min_price_data:
+                max_price_data = min_price_data
+        else:
+            min_price_data, max_price_data = 1.0, 5000.0
+
+        default_low = 100.0 if max_price_data >= 100 else min_price_data
+        default_high = max_price_data
+        if default_low > default_high:
+            default_low = min_price_data
+
+        fcol1, fcol2, fcol3 = st.columns(3)
+        with fcol1:
+            price_range = st.slider(
+                "Price Range (INR)",
+                min_value=float(min_price_data),
+                max_value=float(max_price_data),
+                value=(float(default_low), float(default_high)),
+                step=1.0,
+                help="Stocks outside this range are excluded from refresh/backtest.",
+            )
+        with fcol2:
+            min_momentum_score = st.slider(
+                "Min Momentum Score",
+                min_value=0,
+                max_value=100,
+                value=60,
+                step=1,
+                help="Higher value prioritizes stronger momentum setups.",
+            )
+            min_volume_ratio = st.slider(
+                "Min Volume Ratio",
+                min_value=0.5,
+                max_value=5.0,
+                value=1.2,
+                step=0.1,
+                help="Require volume confirmation to back price movement.",
+            )
+        with fcol3:
+            require_uptrend = st.checkbox(
+                "Uptrend Structure Only",
+                value=True,
+                help="Keep stocks where SMA20 > SMA50 > SMA200.",
+            )
+
+        cond = pd.Series(True, index=merged_df.index)
+        if "ltp" in merged_df.columns:
+            cond &= merged_df["ltp"].between(price_range[0], price_range[1], inclusive="both")
+        if "momentum_score" in merged_df.columns:
+            cond &= merged_df["momentum_score"].fillna(0) >= min_momentum_score
+        if "volume_ratio" in merged_df.columns:
+            cond &= merged_df["volume_ratio"].fillna(0) >= min_volume_ratio
+        if require_uptrend and {"sma_20", "sma_50", "sma_200"}.issubset(merged_df.columns):
+            cond &= (merged_df["sma_20"] > merged_df["sma_50"]) & (merged_df["sma_50"] > merged_df["sma_200"])
+
+        merged_df_filtered = merged_df[cond].copy()
+        filtered_symbols = (
+            merged_df_filtered["symbol"].dropna().astype(str).str.upper().unique().tolist()
+            if "symbol" in merged_df_filtered.columns
+            else []
+        )
+        st.caption(f"Using {len(filtered_symbols)} of {len(merged_df)} stocks for Refresh/Backtest.")
+    else:
+        merged_df_filtered = pd.DataFrame()
+        st.info("Run Refresh Metrics once to enable price/momentum/volume filtering.")
 
     col1, col2, col3 = st.columns(3)
     
@@ -588,23 +722,16 @@ with tab_market:
         if st.button("🔄 Refresh Metrics", use_container_width=True):
             if not symbols:
                 st.warning("Load stock universe first before refreshing metrics.")
+            elif not filtered_symbols:
+                st.warning("No stocks match current filter. Widen range or lower thresholds.")
             else:
-                progress_bar = st.progress(0, text="Starting metrics refresh...")
+                progress_bar = st.progress(0, text="Starting refresh pipeline...")
                 try:
-                    z_client = get_zerodha_client()
-
-                    def _on_progress(done: int, total: int, sym: str, status: str):
-                        ratio = 0.0 if total <= 0 else done / total
-                        progress_bar.progress(
-                            min(1.0, ratio),
-                            text=f"Refreshing metrics {done}/{total}: {sym} ({status})",
-                        )
-
-                    result = z_client.refresh_latest_metrics(symbols, progress_cb=_on_progress)
-                    progress_bar.progress(1.0, text="Refreshing sector buckets...")
-
-                    z_client.refresh_sector_buckets(symbols)
-                    threading.Thread(target=_run_backend_training, daemon=True).start()
+                    metrics_result, bt_result = _refresh_metrics_with_backtest(filtered_symbols, progress_bar)
+                    st.success(
+                        f"Updated metrics for {metrics_result.get('updated_symbols', 0)} symbols and "
+                        f"backtest recalibrated {bt_result.get('updated_symbols', 0)} symbols."
+                    )
                     st.rerun()
                 except ZerodhaConfigError as exc:
                     st.error(str(exc))
@@ -618,6 +745,8 @@ with tab_market:
         if st.button("🧪 Backtest + AI Boost", use_container_width=True):
             if not symbols:
                 st.warning("Load stock universe first before backtesting.")
+            elif not filtered_symbols:
+                st.warning("No stocks match current filter. Widen range or lower thresholds.")
             else:
                 progress_bar = st.progress(0, text="Starting strategy backtest...")
                 try:
@@ -631,7 +760,7 @@ with tab_market:
                         )
 
                     bt_result = z_client.run_backtest_ai_calibration(
-                        symbols=symbols,
+                        symbols=filtered_symbols,
                         lookback_days=260,
                         hold_days=5,
                         progress_cb=_on_backtest_progress,
@@ -658,24 +787,8 @@ with tab_market:
     if active_stocks:
         # Show stocks + metrics table directly
         st.markdown("#### 📋 Stocks")
-        stocks_df = pd.DataFrame(active_stocks)
-        stocks_df = stocks_df[[c for c in stocks_df.columns if c not in ("load_date", "valid_till")]]
-
-        latest_metrics = get_latest_metrics()
-        metrics_df = pd.DataFrame(latest_metrics) if latest_metrics else pd.DataFrame()
-
-        if not metrics_df.empty:
-            if "date" in metrics_df.columns:
-                metrics_df = metrics_df[metrics_df["date"] == date.today().isoformat()]
-            merged_df = stocks_df.merge(metrics_df, on="symbol", how="left", suffixes=("", "_metric"))
-            if "ltp" in merged_df.columns:
-                merged_df = merged_df[merged_df["ltp"].notna()]
-            merged_df = merged_df.sort_values(by="symbol").reset_index(drop=True)
-        else:
-            merged_df = pd.DataFrame()
-
-        if merged_df.empty:
-            st.info("No successful metric rows to display yet. Click Refresh Metrics.")
+        if merged_df_filtered.empty:
+            st.info("No stocks match current filter. Widen the range or lower momentum/volume thresholds.")
         else:
             preferred_order = [
                 "symbol", "company", "sector",
@@ -686,9 +799,9 @@ with tab_market:
                 "trend_score", "momentum_score", "volatility_score", "liquidity_score",
                 "volume_ratio", "date"
             ]
-            front = [c for c in preferred_order if c in merged_df.columns]
-            rest = [c for c in merged_df.columns if c not in front]
-            display_df = merged_df[front + rest].copy()
+            front = [c for c in preferred_order if c in merged_df_filtered.columns]
+            rest = [c for c in merged_df_filtered.columns if c not in front]
+            display_df = merged_df_filtered[front + rest].copy()
 
             header_map = {
                 "symbol": "Symbol",
@@ -1024,6 +1137,20 @@ with tab_portfolio:
                 
                 if selected_trades:
                     st.success(f"✅ Selected {len(selected_trades)} high-quality trades")
+
+                    intraday_count = sum(1 for t in selected_trades if t.get('mode') == 'intraday')
+                    swing_trades = [t for t in selected_trades if t.get('mode') == 'swing']
+                    swing_count = len(swing_trades)
+                    swing_capital_lock = sum(float(t.get('position_value', 0) or 0) for t in swing_trades)
+                    avg_swing_hold = (
+                        sum(int(t.get('expected_holding_days', 1) or 1) for t in swing_trades) / swing_count
+                        if swing_count > 0 else 0
+                    )
+                    st.info(
+                        f"Priority mix: Intraday {intraday_count} | Swing {swing_count}. "
+                        f"Estimated swing capital lock: ₹{swing_capital_lock:,.0f} "
+                        f"for ~{avg_swing_hold:.1f} days."
+                    )
                     
                     # Display selected trades
                     trades_data = []
@@ -1031,6 +1158,7 @@ with tab_portfolio:
                         trades_data.append({
                             'Symbol': trade['symbol'],
                             'Mode': trade['mode'].upper(),
+                            'Hold (Days)': int(trade.get('expected_holding_days', 1)),
                             'Entry': f"₹{trade['entry']:.2f}",
                             'Stop Loss': f"₹{trade['stop_loss']:.2f}",
                             'Target': f"₹{trade['target']:.2f}",

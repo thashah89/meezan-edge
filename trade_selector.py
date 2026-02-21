@@ -129,6 +129,16 @@ class TradeSelector:
             else:
                 swing_capital_used += position_value
         
+        # Prioritize intraday ideas first, then stronger win probability/opportunity score.
+        selected_trades = sorted(
+            selected_trades,
+            key=lambda t: (
+                0 if t.get('mode') == 'intraday' else 1,
+                -float(t.get('win_probability', 0)),
+                -float(t.get('opportunity_score', 0)),
+            ),
+        )
+
         log.info(f"Selected {len(selected_trades)} trades "
                 f"(Intraday: {sum(1 for t in selected_trades if t['mode']=='intraday')}, "
                 f"Swing: {sum(1 for t in selected_trades if t['mode']=='swing')})")
@@ -250,6 +260,7 @@ class TradeSelector:
             'reward_per_share': round(reward_per_share, 2),
             'rr_ratio': round(actual_rr, 2),
             'mode': mode,
+            'expected_holding_days': self._estimate_holding_days(opportunity, mode),
             'strategy': opportunity.get('strategy_fit', 'general'),
             'win_probability': opportunity.get('win_probability', 0.5),
             'expected_return': opportunity.get('expected_return', 0),
@@ -262,6 +273,20 @@ class TradeSelector:
             'entry_trend_score': opportunity.get('trend_score'),
             'entry_volume_ratio': opportunity.get('volume_ratio'),
         }
+
+    def _estimate_holding_days(self, opportunity: Dict, mode: str) -> int:
+        """
+        Estimate capital lock-in duration for user visibility.
+        """
+        if mode == 'intraday':
+            return 1
+
+        strategy = str(opportunity.get('strategy_fit', '')).lower()
+        if strategy in ['breakout', 'momentum']:
+            return 3
+        if strategy in ['swing', 'trend_pullback', 'adx_trend_follow']:
+            return 5
+        return 4
     
     def validate_trade(self, trade: Dict) -> Tuple[bool, str]:
         """

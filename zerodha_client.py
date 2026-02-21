@@ -440,7 +440,8 @@ class ZerodhaClient:
                     )
 
                     if best_strategy == "none":
-                        final_strategy = determine_strategy_fit(enriched)
+                        final_strategy = "none"
+                        final_confidence = max(40.0, final_confidence - 12.0)
                     else:
                         final_strategy = best_strategy
 
@@ -883,11 +884,15 @@ class ZerodhaClient:
             entry = self._safe_float(row.get("close"), 0.0)
             if entry <= 0:
                 continue
-            exit_price = self._safe_float(ind_df.iloc[i + hold_days].get("close"), entry)
-            ret_pct = ((exit_price - entry) / entry) * 100.0
 
             for strat in stats.keys():
                 if self._strategy_signal(row, strat):
+                    ret_pct = self._simulate_trade_return(
+                        ind_df=ind_df,
+                        entry_idx=i,
+                        hold_days=hold_days,
+                        strategy=strat,
+                    )
                     stats[strat]["trades"] += 1
                     stats[strat]["sum_return"] += ret_pct
                     if ret_pct > 0:
@@ -909,6 +914,52 @@ class ZerodhaClient:
         return out
 
     @classmethod
+    def _simulate_trade_return(
+        cls,
+        ind_df: pd.DataFrame,
+        entry_idx: int,
+        hold_days: int,
+        strategy: str,
+    ) -> float:
+        """
+        Simulate return using stop/target intraperiod checks instead of only fixed close exit.
+        """
+        row = ind_df.iloc[entry_idx]
+        entry = cls._safe_float(row.get("close"), 0.0)
+        if entry <= 0:
+            return 0.0
+
+        atr = max(0.01, cls._safe_float(row.get("ATR"), entry * 0.01))
+        if strategy in {"breakout", "volatility_squeeze", "range_breakout"}:
+            sl_mult, tgt_mult = 1.0, 2.2
+        elif strategy in {"mean_revert", "bollinger_revert", "macd_reversal"}:
+            sl_mult, tgt_mult = 0.9, 1.5
+        else:
+            sl_mult, tgt_mult = 1.1, 2.0
+
+        stop = max(0.01, entry - (atr * sl_mult))
+        target = entry + (atr * tgt_mult)
+
+        end_idx = min(len(ind_df) - 1, entry_idx + hold_days)
+        exit_price = cls._safe_float(ind_df.iloc[end_idx].get("close"), entry)
+
+        for j in range(entry_idx + 1, end_idx + 1):
+            rj = ind_df.iloc[j]
+            hi = cls._safe_float(rj.get("high"), cls._safe_float(rj.get("close"), exit_price))
+            lo = cls._safe_float(rj.get("low"), cls._safe_float(rj.get("close"), exit_price))
+            if lo <= stop:
+                exit_price = stop
+                break
+            if hi >= target:
+                exit_price = target
+                break
+            exit_price = cls._safe_float(rj.get("close"), exit_price)
+
+        gross_ret = ((exit_price - entry) / entry) * 100.0
+        trading_cost = 0.18  # approximate round-trip friction in %
+        return gross_ret - trading_cost
+
+    @classmethod
     def _strategy_signal(cls, row, strategy: str) -> bool:
         rule = cls._strategy_rules().get(strategy)
         if not rule:
@@ -926,6 +977,14 @@ class ZerodhaClient:
             "breakout": ZerodhaClient._rule_breakout,
             "swing": ZerodhaClient._rule_swing,
             "mean_revert": ZerodhaClient._rule_mean_revert,
+            "trend_pullback": ZerodhaClient._rule_trend_pullback,
+            "ema_crossover": ZerodhaClient._rule_ema_crossover,
+            "macd_reversal": ZerodhaClient._rule_macd_reversal,
+            "volatility_squeeze": ZerodhaClient._rule_volatility_squeeze,
+            "range_breakout": ZerodhaClient._rule_range_breakout,
+            "rsi_momentum": ZerodhaClient._rule_rsi_momentum,
+            "adx_trend_follow": ZerodhaClient._rule_adx_trend_follow,
+            "bollinger_revert": ZerodhaClient._rule_bollinger_revert,
         }
 
     @classmethod
@@ -964,6 +1023,77 @@ class ZerodhaClient:
         adx = cls._safe_float(row.get("ADX"), 20.0)
         return rsi <= 35 and adx <= 22
 
+    @classmethod
+    def _rule_trend_pullback(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        sma50 = cls._safe_float(row.get("SMA_50"), close)
+        sma200 = cls._safe_float(row.get("SMA_200"), close)
+        return close > sma50 and sma50 > sma200 and 42 <= rsi <= 55 and adx >= 18
+
+    @classmethod
+    def _rule_ema_crossover(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        ema9 = cls._safe_float(row.get("EMA_9"), close)
+        ema21 = cls._safe_float(row.get("EMA_21"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        return ema9 > ema21 and close > ema21 and adx >= 18
+
+    @classmethod
+    def _rule_macd_reversal(cls, row) -> bool:
+        macd = cls._safe_float(row.get("MACD"), 0.0)
+        macd_signal = cls._safe_float(row.get("MACD_Signal"), 0.0)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        return macd > macd_signal and 35 <= rsi <= 55 and adx <= 25
+
+    @classmethod
+    def _rule_volatility_squeeze(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        sma20 = cls._safe_float(row.get("SMA_20"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        bb_width_raw = cls._safe_float(row.get("BB_Width"), 0.0)
+        bb_width = bb_width_raw / 100.0 if bb_width_raw > 1 else bb_width_raw
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        return bb_width <= 0.02 and close >= sma20 and volume_ratio >= 1.15 and adx >= 15
+
+    @classmethod
+    def _rule_range_breakout(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        high = cls._safe_float(row.get("high"), close)
+        low = cls._safe_float(row.get("low"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        volume_ratio = cls._safe_float(row.get("Volume_Ratio"), 1.0)
+        if close <= 0:
+            return False
+        range_pct = ((high - low) / close) * 100.0
+        return range_pct >= 1.2 and volume_ratio >= 1.2 and adx >= 16
+
+    @classmethod
+    def _rule_rsi_momentum(cls, row) -> bool:
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        macd = cls._safe_float(row.get("MACD"), 0.0)
+        macd_signal = cls._safe_float(row.get("MACD_Signal"), 0.0)
+        return rsi >= 60 and adx >= 20 and macd > macd_signal
+
+    @classmethod
+    def _rule_adx_trend_follow(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        sma20 = cls._safe_float(row.get("SMA_20"), close)
+        sma50 = cls._safe_float(row.get("SMA_50"), close)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        return close > sma20 and sma20 > sma50 and adx >= 28
+
+    @classmethod
+    def _rule_bollinger_revert(cls, row) -> bool:
+        close = cls._safe_float(row.get("close"), 0.0)
+        bb_lower = cls._safe_float(row.get("BB_Lower"), close)
+        rsi = cls._safe_float(row.get("RSI"), 50.0)
+        adx = cls._safe_float(row.get("ADX"), 20.0)
+        return close <= bb_lower * 1.01 and rsi <= 35 and adx <= 22
+
     @staticmethod
     def _pick_best_strategy(backtest: Dict[str, Dict]) -> Tuple[str, Dict]:
         best_name = "none"
@@ -973,14 +1103,29 @@ class ZerodhaClient:
             trades = int(info.get("trades", 0))
             win_rate = float(info.get("win_rate", 0.5))
             avg_return = float(info.get("avg_return", 0.0))
-            confidence_bonus = min(0.15, trades / 200.0)
-            score = (win_rate * 100.0) + (avg_return * 5.0) + (confidence_bonus * 100.0)
-            if trades < 5:
-                score -= 12.0
+            consistency = min(20.0, trades * 0.2)
+            accuracy_component = (win_rate - 0.5) * 120.0
+            return_component = avg_return * 8.0
+            score = accuracy_component + return_component + consistency
+            if trades < 8:
+                score -= (8 - trades) * 3.0
+            if avg_return < 0:
+                score -= 10.0
             if score > best_score:
                 best_score = score
                 best_name = name
                 best_info = info
+
+        min_trades = 12
+        min_win_rate = 0.52
+        min_avg_return = 0.05
+        if (
+            int(best_info.get("trades", 0)) < min_trades
+            or float(best_info.get("win_rate", 0.0)) < min_win_rate
+            or float(best_info.get("avg_return", 0.0)) < min_avg_return
+        ):
+            return "none", best_info
+
         return best_name, best_info
 
     @staticmethod

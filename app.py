@@ -21,6 +21,7 @@ sys.path.insert(0, str(current_dir))
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, date, timedelta
@@ -205,6 +206,97 @@ def _is_live_market_hours(now_ist: datetime | None = None) -> bool:
     market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_open <= now_ist <= market_close
+
+
+def _fetch_nse_top_gainers_halal(halal_symbols: list[str], top_n: int = 10) -> pd.DataFrame:
+    """
+    Fetch NSE top gainers and keep only symbols present in halal universe.
+    Returns empty DataFrame if data is unavailable.
+    """
+    if not halal_symbols:
+        return pd.DataFrame()
+
+    halal_set = {str(s).upper().strip() for s in halal_symbols if s}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://www.nseindia.com/market-data/top-gainers-losers",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    api_urls = [
+        "https://www.nseindia.com/api/live-analysis-variations?index=gainers",
+        "https://www.nseindia.com/api/live-analysis-variations?index=loosers",  # NSE typo guard
+    ]
+
+    try:
+        with requests.Session() as session:
+            session.headers.update(headers)
+            session.get("https://www.nseindia.com", timeout=15)
+
+            payload = None
+            for url in api_urls:
+                try:
+                    resp = session.get(url, timeout=20)
+                    if resp.ok:
+                        payload = resp.json()
+                        if payload:
+                            break
+                except Exception:
+                    continue
+
+        if not payload:
+            return pd.DataFrame()
+
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+
+        symbol_col = "symbol" if "symbol" in df.columns else None
+        if not symbol_col:
+            return pd.DataFrame()
+
+        df["symbol"] = df[symbol_col].astype(str).str.upper().str.strip()
+        df = df[df["symbol"].isin(halal_set)]
+        if df.empty:
+            return df
+
+        rename_map = {
+            "symbol": "Symbol",
+            "openPrice": "Open",
+            "highPrice": "High",
+            "lowPrice": "Low",
+            "ltp": "LTP",
+            "previousPrice": "Prev Close",
+            "netPrice": "Change %",
+            "turnoverInLakhs": "Turnover (L)",
+            "lastCorpAnnouncementDate": "Corp Date",
+        }
+        for old, new in rename_map.items():
+            if old in df.columns:
+                df = df.rename(columns={old: new})
+
+        if "Change %" not in df.columns and "pChange" in df.columns:
+            df = df.rename(columns={"pChange": "Change %"})
+
+        sort_col = "Change %" if "Change %" in df.columns else None
+        if sort_col:
+            df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
+            df = df.sort_values(by=sort_col, ascending=False)
+
+        preferred = [c for c in ["Symbol", "LTP", "Change %", "Open", "High", "Low", "Turnover (L)"] if c in df.columns]
+        rest = [c for c in df.columns if c not in preferred]
+        return df[preferred + rest].head(top_n).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
 
 
 def _bootstrap_stock_universe_if_empty():
@@ -751,7 +843,7 @@ with tab_market:
                     "winning_trades": "Wins",
                     "win_rate": "Win Rate",
                     "avg_return": "Avg Return",
-                    "total_return": "Total Return",
+                    "total_return": "Total Return (Pts)",
                     "updated_at": "Updated At",
                 }
             )
@@ -759,8 +851,8 @@ with tab_market:
                 bt_df["Win Rate"] = bt_df["Win Rate"].apply(lambda x: f"{(x or 0) * 100:.1f}%")
             if "Avg Return" in bt_df.columns:
                 bt_df["Avg Return"] = bt_df["Avg Return"].apply(lambda x: f"{(x or 0):.2f}%")
-            if "Total Return" in bt_df.columns:
-                bt_df["Total Return"] = bt_df["Total Return"].apply(lambda x: f"{(x or 0):.2f}%")
+            if "Total Return (Pts)" in bt_df.columns:
+                bt_df["Total Return (Pts)"] = bt_df["Total Return (Pts)"].apply(lambda x: f"{(x or 0):.2f}")
             if "Strategy" in bt_df.columns:
                 bt_df["Strategy"] = bt_df["Strategy"].astype(str).str.replace("_", " ").str.title()
 
@@ -814,6 +906,18 @@ with tab_market:
             df_filt = pd.DataFrame(filtered)
             st.dataframe(df_filt[['symbol', 'opportunity_score', 'strategy_fit']], 
                         use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("📈 NSE Top 10 Gainers (Halal Only)")
+    try:
+        halal_symbols = [s.get("symbol") for s in active_stocks if s.get("symbol")]
+        gainers_df = _fetch_nse_top_gainers_halal(halal_symbols, top_n=10)
+        if gainers_df.empty:
+            st.info("NSE top gainers data unavailable right now or no overlap with loaded halal stocks.")
+        else:
+            st.dataframe(gainers_df, use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.warning(f"Could not load NSE gainers: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1256,17 +1360,87 @@ with tab_ai:
     
     conn.close()
     
-    # Pattern discoveries
-    st.markdown("##### 🔍 Pattern Discoveries")
-    
-    discover_col1, discover_col2 = st.columns(2)
-    
-    with discover_col1:
-        st.info("**High Win Pattern**\n\nRSI > 60 + ADX > 30 + Uptrend\n\n→ 78% win rate detected")
-    
-    with discover_col2:
-        st.warning("**Avoid Pattern**\n\nRSI < 30 + ADX < 15 + Sideways\n\n→ 32% win rate (avoid)")
-    
+    # Pattern discoveries (data-driven)
+    st.markdown("##### Pattern Discoveries (Detailed)")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            strategy_name,
+            total_trades,
+            winning_trades,
+            losing_trades,
+            win_rate,
+            avg_return,
+            total_return,
+            updated_at
+        FROM strategy_performance
+        WHERE total_trades IS NOT NULL
+        ORDER BY total_return DESC, win_rate DESC
+        LIMIT 20
+        """
+    )
+    bt_pattern_rows = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT
+            pattern_key,
+            trades,
+            wins,
+            win_rate,
+            avg_return,
+            updated_at
+        FROM pattern_signals
+        WHERE trades >= 8
+        ORDER BY win_rate DESC, avg_return DESC
+        LIMIT 30
+        """
+    )
+    signal_rows = cursor.fetchall()
+    conn.close()
+
+    if bt_pattern_rows:
+        bt_df = pd.DataFrame([dict(r) for r in bt_pattern_rows])
+        bt_df["win_pct"] = (pd.to_numeric(bt_df["win_rate"], errors="coerce").fillna(0.0) * 100.0)
+        bt_df["expectancy"] = pd.to_numeric(bt_df["avg_return"], errors="coerce").fillna(0.0)
+        bt_df["quality_score"] = (
+            (bt_df["win_pct"] - 50.0) * 0.7
+            + bt_df["expectancy"] * 6.0
+            + np.minimum(pd.to_numeric(bt_df["total_trades"], errors="coerce").fillna(0.0), 100.0) * 0.1
+        )
+        bt_df = bt_df.sort_values(by=["quality_score", "total_return"], ascending=False)
+
+        bt_show = pd.DataFrame({
+            "Strategy": bt_df["strategy_name"].astype(str).str.replace("_", " ").str.title(),
+            "Trades": bt_df["total_trades"],
+            "Wins": bt_df["winning_trades"],
+            "Losses": bt_df["losing_trades"],
+            "Win Rate": bt_df["win_pct"].map(lambda x: f"{x:.1f}%"),
+            "Avg Return": bt_df["expectancy"].map(lambda x: f"{x:.2f}%"),
+            "Total Return (Pts)": pd.to_numeric(bt_df["total_return"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}"),
+            "Quality Score": bt_df["quality_score"].map(lambda x: f"{x:.2f}"),
+            "Updated": bt_df["updated_at"],
+        })
+        st.dataframe(bt_show.head(15), use_container_width=True, hide_index=True)
+
+    if signal_rows:
+        sig_df = pd.DataFrame([dict(r) for r in signal_rows])
+        sig_show = pd.DataFrame({
+            "Pattern": sig_df["pattern_key"],
+            "Trades": sig_df["trades"],
+            "Wins": sig_df["wins"],
+            "Win Rate": (pd.to_numeric(sig_df["win_rate"], errors="coerce").fillna(0.0) * 100.0).map(lambda x: f"{x:.1f}%"),
+            "Avg Return": pd.to_numeric(sig_df["avg_return"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}%"),
+            "Updated": sig_df["updated_at"],
+        })
+        st.dataframe(sig_show.head(20), use_container_width=True, hide_index=True)
+    elif not bt_pattern_rows:
+        st.info("No detailed pattern data available yet. Run Backtest + AI Boost and refresh metrics first.")
+
     st.markdown("---")
     
     # ── Section C: AI Predictions ────────────────────────────────────────────

@@ -1072,18 +1072,44 @@ class ZerodhaClient:
 
         for j in range(entry_idx + 1, end_idx + 1):
             rj = ind_df.iloc[j]
+            open_px = cls._safe_float(rj.get("open"), cls._safe_float(rj.get("close"), exit_price))
+            close_px = cls._safe_float(rj.get("close"), open_px)
             hi = cls._safe_float(rj.get("high"), cls._safe_float(rj.get("close"), exit_price))
             lo = cls._safe_float(rj.get("low"), cls._safe_float(rj.get("close"), exit_price))
-            if lo <= stop:
-                exit_price = stop
+            hit_stop = lo <= stop
+            hit_target = hi >= target
+
+            # If both stop and target are touched in the same daily candle,
+            # use candle direction as a fair tie-breaker instead of always
+            # assuming stop-loss first (which is overly pessimistic).
+            if hit_stop and hit_target:
+                exit_price = target if close_px >= open_px else stop
                 break
-            if hi >= target:
+            if hit_target:
                 exit_price = target
+                break
+            if hit_stop:
+                exit_price = stop
                 break
             exit_price = cls._safe_float(rj.get("close"), exit_price)
 
         gross_ret = ((exit_price - entry) / entry) * 100.0
-        trading_cost = 0.18  # approximate round-trip friction in %
+        # Strategy-aware round-trip friction (%) tuned for paper backtest realism.
+        trading_cost_by_strategy = {
+            "breakout": 0.12,
+            "volatility_squeeze": 0.12,
+            "range_breakout": 0.12,
+            "momentum": 0.10,
+            "rsi_momentum": 0.10,
+            "adx_trend_follow": 0.10,
+            "swing": 0.08,
+            "trend_pullback": 0.08,
+            "ema_crossover": 0.08,
+            "mean_revert": 0.09,
+            "bollinger_revert": 0.09,
+            "macd_reversal": 0.09,
+        }
+        trading_cost = trading_cost_by_strategy.get(strategy, 0.10)
         return gross_ret - trading_cost
 
     @classmethod

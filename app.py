@@ -74,6 +74,35 @@ def get_engines():
 
 engines = get_engines()
 
+IST_ZONE = ZoneInfo("Asia/Kolkata")
+UTC_ZONE = ZoneInfo("UTC")
+
+
+def _format_utc_to_ist(value) -> str:
+    """Format UTC timestamp values from SQLite into IST display strings."""
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        elif "T" in raw:
+            normalized = raw.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+        else:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC_ZONE)
+        else:
+            dt = dt.astimezone(UTC_ZONE)
+
+        return dt.astimezone(IST_ZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return raw
+
 
 def get_zerodha_client() -> ZerodhaClient:
     """Build Zerodha client from Streamlit secrets + session token."""
@@ -1144,6 +1173,8 @@ with tab_market:
                 bt_df["Total Return (Pts)"] = bt_df["Total Return (Pts)"].apply(lambda x: f"{(x or 0):.2f}")
             if "Strategy" in bt_df.columns:
                 bt_df["Strategy"] = bt_df["Strategy"].astype(str).str.replace("_", " ").str.title()
+            if "Updated At" in bt_df.columns:
+                bt_df["Updated At"] = bt_df["Updated At"].apply(_format_utc_to_ist)
 
             st.dataframe(bt_df, use_container_width=True, hide_index=True)
         else:
@@ -1750,7 +1781,7 @@ with tab_ai:
             "Avg Return": bt_df["expectancy"].map(lambda x: f"{x:.2f}%"),
             "Total Return (Pts)": pd.to_numeric(bt_df["total_return"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}"),
             "Quality Score": bt_df["quality_score"].map(lambda x: f"{x:.2f}"),
-            "Updated": bt_df["updated_at"],
+            "Updated": bt_df["updated_at"].apply(_format_utc_to_ist),
         })
         st.dataframe(bt_show.head(15), use_container_width=True, hide_index=True)
 
@@ -1762,7 +1793,7 @@ with tab_ai:
             "Wins": sig_df["wins"],
             "Win Rate": (pd.to_numeric(sig_df["win_rate"], errors="coerce").fillna(0.0) * 100.0).map(lambda x: f"{x:.1f}%"),
             "Avg Return": pd.to_numeric(sig_df["avg_return"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}%"),
-            "Updated": sig_df["updated_at"],
+            "Updated": sig_df["updated_at"].apply(_format_utc_to_ist),
         })
         st.dataframe(sig_show.head(20), use_container_width=True, hide_index=True)
     elif not bt_pattern_rows:

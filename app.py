@@ -1136,17 +1136,39 @@ with tab_market:
     if metrics_list:
         # Score opportunities (defensive: tolerate partial/bad rows)
         scored = []
-        try:
-            cleaned_metrics = []
-            for row in metrics_list:
+        cleaned_metrics = []
+        skipped_rows = 0
+        for row in metrics_list:
+            try:
+                row_dict = dict(row) if not isinstance(row, dict) else row
+            except Exception:
+                skipped_rows += 1
+                continue
+            symbol = str(row_dict.get("symbol", "")).strip().upper()
+            if not symbol:
+                skipped_rows += 1
+                continue
+            row_dict["symbol"] = symbol
+            cleaned_metrics.append(row_dict)
+
+        scoring_error = None
+        if cleaned_metrics:
+            try:
+                scored = engines['intel'].score_opportunities(cleaned_metrics)
+            except Exception as exc:
+                scoring_error = exc
+                log.warning("Batch opportunity scoring failed. Falling back to safe scorer: %s", exc)
                 try:
-                    cleaned_metrics.append(dict(row) if not isinstance(row, dict) else row)
-                except Exception:
-                    continue
-            scored = engines['intel'].score_opportunities(cleaned_metrics)
-        except Exception as exc:
-            log.warning("Opportunity scoring failed on current metrics batch: %s", exc)
-            st.warning("Opportunity scoring skipped for some invalid rows. Please refresh metrics.")
+                    from market_intel_engine import score_all_stocks
+                    scored = score_all_stocks(cleaned_metrics, getattr(engines["intel"], "sentiment", None))
+                except Exception as exc2:
+                    scoring_error = exc2
+                    scored = []
+
+        if skipped_rows > 0:
+            st.caption(f"Skipped {skipped_rows} invalid metric row(s) before scoring.")
+        if scoring_error and not scored:
+            st.warning(f"Opportunity scoring failed for this batch: {scoring_error}")
         
         if scored:
             df_opp = pd.DataFrame(scored)
@@ -1208,7 +1230,10 @@ with tab_market:
             else:
                 st.warning("No breakout/reversal/high-potential stocks found in today's refreshed metrics.")
         else:
-            st.warning("No opportunities found. Refresh metrics.")
+            if cleaned_metrics:
+                st.warning("No opportunities found from the current metrics set.")
+            else:
+                st.warning("No valid metric rows found. Refresh metrics and try again.")
     else:
         st.info("Run Refresh Metrics first. Potential stock list displays only after today's metrics are generated.")
 

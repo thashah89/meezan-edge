@@ -649,6 +649,7 @@ class ZerodhaClient:
         failed_symbols = 0
         strategy_distribution: Dict[str, int] = {}
         strategy_rules = self._strategy_rules()
+        use_external_reco = len(symbols) <= 60
         global_stats = {
             name: {"trades": 0, "wins": 0, "sum_return": 0.0}
             for name in strategy_rules.keys()
@@ -779,7 +780,10 @@ class ZerodhaClient:
                         99.0,
                         max(45.0, 42.0 + (trade_count * 0.9) + (final_win * 30.0) + min(10.0, abs(final_profit) * 2.0)),
                     )
-                    reco_info = self._get_external_recommendation_signal(symbol)
+                    reco_info = self._get_external_recommendation_signal(
+                        symbol,
+                        enabled=use_external_reco,
+                    )
                     reco_score = float(reco_info.get("score", 0.0))
                     reco_hit = float(reco_info.get("hit_rate", 0.5))
                     reco_samples = int(reco_info.get("sample_size", 0))
@@ -889,6 +893,7 @@ class ZerodhaClient:
             "strategy_distribution": strategy_distribution,
             "timeframe_coverage": timeframe_coverage,
             "intervals_used": [p[0] for p in self._build_interval_plan(len(symbols), lookback_days, hold_days)],
+            "external_reco_enabled": use_external_reco,
         }
 
     @staticmethod
@@ -1022,7 +1027,7 @@ class ZerodhaClient:
             "reco_source": "none",
         }
 
-    def _get_external_recommendation_signal(self, symbol: str) -> Dict[str, Any]:
+    def _get_external_recommendation_signal(self, symbol: str, enabled: bool = True) -> Dict[str, Any]:
         """
         Pull analyst recommendation consensus and historical recommendation hit-rate
         from Yahoo Finance and convert to normalized signal.
@@ -1030,6 +1035,8 @@ class ZerodhaClient:
         key = self.normalize_symbol(symbol)
         if not key:
             return {"score": 0.0, "hit_rate": 0.5, "sample_size": 0, "label": "neutral", "source": "none"}
+        if not enabled:
+            return {"score": 0.0, "hit_rate": 0.5, "sample_size": 0, "label": "neutral", "source": "disabled_for_large_run"}
         cached = self._reco_cache.get(key)
         if cached:
             return cached
@@ -1048,7 +1055,7 @@ class ZerodhaClient:
                 "?modules=recommendationTrend,financialData,upgradeDowngradeHistory"
             )
             headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(summary_url, timeout=4, headers=headers)
+            resp = requests.get(summary_url, timeout=1.8, headers=headers)
             data = resp.json()
             result = (((data or {}).get("quoteSummary") or {}).get("result") or [{}])[0]
             trend = (((result.get("recommendationTrend") or {}).get("trend") or [{}])[0])
@@ -1069,7 +1076,7 @@ class ZerodhaClient:
             target_component = max(-1.0, min(1.0, target_gap / 0.20))
 
             hist_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2y"
-            hresp = requests.get(hist_url, timeout=4, headers=headers)
+            hresp = requests.get(hist_url, timeout=1.8, headers=headers)
             hdata = hresp.json()
             hres = (((hdata or {}).get("chart") or {}).get("result") or [{}])[0]
             ts = hres.get("timestamp") or []

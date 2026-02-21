@@ -119,6 +119,60 @@ def _mark_operation_run(op_key: str):
     op_runs[op_key] = op_state
 
 
+def _get_backtest_approved_symbols(
+    strategy_name: str = "vwap_pullback",
+    min_trades: int = 3,
+    min_win_rate: float = 0.50,
+    min_avg_return: float = 0.0,
+) -> set[str]:
+    """
+    Use latest backtest run and keep symbols with acceptable historical edge.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT run_id
+            FROM backtest_trades
+            WHERE strategy_name = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (strategy_name,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return set()
+        run_id = str(row[0])
+        cur.execute(
+            """
+            SELECT
+                symbol,
+                COUNT(*) AS trades,
+                AVG(return_pct) AS avg_return,
+                AVG(CASE WHEN return_pct > 0 THEN 1.0 ELSE 0.0 END) AS win_rate
+            FROM backtest_trades
+            WHERE run_id = ? AND strategy_name = ?
+            GROUP BY symbol
+            """,
+            (run_id, strategy_name),
+        )
+        approved = set()
+        for r in cur.fetchall():
+            symbol = str(r[0]).upper()
+            trades = int(r[1] or 0)
+            avg_ret = float(r[2] or 0.0)
+            win_rate = float(r[3] or 0.0)
+            if trades >= min_trades and win_rate >= min_win_rate and avg_ret >= min_avg_return:
+                approved.add(symbol)
+        return approved
+    except Exception:
+        return set()
+    finally:
+        conn.close()
+
+
 def get_zerodha_client() -> ZerodhaClient:
     """Build Zerodha client from Streamlit secrets + session token."""
     try:
@@ -1000,6 +1054,12 @@ with tab_market:
                         f" (failed: {bt_result['failed_symbols']})."
                     )
                     _mark_operation_run("backtest_ai_boost")
+                    if not bt_result.get("external_reco_enabled", True):
+                        st.caption("External recommendation web-scan auto-disabled for large universe to keep backtest stable.")
+                    if bt_result.get("updated_symbols", 0) == 0 and bt_result.get("failures"):
+                        top_failures = bt_result["failures"][:5]
+                        msg = "; ".join([f"{sym}: {reason}" for sym, reason in top_failures])
+                        st.error(f"Backtest produced 0 updated symbols. Top failure reasons: {msg}")
                     if bt_result.get("strategy_distribution"):
                         dist = ", ".join(
                             [f"{k}: {v}" for k, v in sorted(bt_result["strategy_distribution"].items())]
@@ -1529,7 +1589,6 @@ with tab_backtest:
                 growth_df["order_date"] = growth_df["order_date"].fillna(pd.Timestamp.min)
                 growth_df = growth_df.sort_values(by=["order_date", "symbol"], ascending=[True, True]).reset_index(drop=True)
                 running_capital = float(starting_capital)
-                min_allowed_capital = float(starting_capital) * (1.0 - (float(max_drawdown_pct) / 100.0))
                 risk_frac = float(risk_per_trade_pct) / 100.0
                 daily_loss_frac = float(max_daily_loss_pct) / 100.0
                 per_trade_pnl = []
@@ -1538,15 +1597,18 @@ with tab_backtest:
                 current_day = None
                 day_pnl = 0.0
                 day_trades = 0
-                stopped_by_drawdown = False
+                drawdown_guard_count = 0
+                hard_drawdown_stop = False
                 skipped_daily_limit = 0
                 skipped_trade_limit = 0
+                peak_capital = float(starting_capital)
+                hard_stop_drawdown_pct = float(max_drawdown_pct) + 8.0
 
                 # Protected simulation:
                 # - risk only a small fraction per trade
                 # - cap per-trade R multiple
                 # - stop trading day after daily loss cap
-                # - stop all trading after max drawdown breach
+                # - use soft drawdown guard (reduced risk) before hard stop
                 for row in growth_df.itertuples(index=False):
                     trade_date = row.order_date.date() if pd.notna(row.order_date) else None
                     if current_day != trade_date:
@@ -1554,11 +1616,16 @@ with tab_backtest:
                         day_pnl = 0.0
                         day_trades = 0
 
-                    if running_capital <= min_allowed_capital:
-                        stopped_by_drawdown = True
+                    if peak_capital > 0:
+                        current_drawdown_pct = max(0.0, ((peak_capital - running_capital) / peak_capital) * 100.0)
+                    else:
+                        current_drawdown_pct = 0.0
+
+                    if current_drawdown_pct >= hard_stop_drawdown_pct:
+                        hard_drawdown_stop = True
                         per_trade_pnl.append(0.0)
                         post_trade_equity.append(running_capital)
-                        trade_action.append("Skipped: max drawdown reached")
+                        trade_action.append("Skipped: hard drawdown stop")
                         continue
 
                     if day_pnl <= -(running_capital * daily_loss_frac):
@@ -1578,13 +1645,21 @@ with tab_backtest:
                     ret_pct = float(getattr(row, "return_pct", 0.0) or 0.0)
                     # Convert return to R-equivalent and cap tail risk.
                     r_multiple = max(-1.0, min(2.5, ret_pct / 1.0))
-                    trade_pnl = running_capital * risk_frac * r_multiple
+                    active_risk_frac = risk_frac
+                    action_label = "Executed"
+                    if current_drawdown_pct >= float(max_drawdown_pct):
+                        active_risk_frac = min(risk_frac, 0.0025)  # 0.25% risk fallback
+                        drawdown_guard_count += 1
+                        action_label = "Executed: drawdown guard"
+
+                    trade_pnl = running_capital * active_risk_frac * r_multiple
                     running_capital += trade_pnl
                     day_pnl += trade_pnl
                     day_trades += 1
+                    peak_capital = max(peak_capital, running_capital)
                     per_trade_pnl.append(trade_pnl)
                     post_trade_equity.append(running_capital)
-                    trade_action.append("Executed")
+                    trade_action.append(action_label)
 
                 growth_df["trade_pnl_inr"] = per_trade_pnl
                 growth_df["equity_after_trade"] = post_trade_equity
@@ -1608,7 +1683,8 @@ with tab_backtest:
                 st.caption(
                     f"Protected simulation: executed {executed_trades}/{total_trades} trades | "
                     f"skipped daily-cap {skipped_daily_limit} | skipped trade-cap {skipped_trade_limit}"
-                    + (" | drawdown stop triggered" if stopped_by_drawdown else "")
+                    + (f" | drawdown-guard trades {drawdown_guard_count}" if drawdown_guard_count > 0 else "")
+                    + (" | hard drawdown stop triggered" if hard_drawdown_stop else "")
                 )
 
                 symbol_summary = (
@@ -1795,12 +1871,45 @@ with tab_portfolio:
             log.warning("Portfolio opportunity scoring failed on current metrics batch: %s", exc)
             st.warning("Allocation skipped for invalid metric rows. Refresh metrics and try again.")
             scored = []
+
+        # Execution gate: only backtest-approved potential stocks.
+        approved_symbols = _get_backtest_approved_symbols(
+            strategy_name="vwap_pullback",
+            min_trades=3,
+            min_win_rate=0.50,
+            min_avg_return=0.0,
+        )
+        execution_candidates = []
+        for s in (scored or []):
+            symbol = str(s.get("symbol", "")).upper().strip()
+            opp = float(pd.to_numeric(s.get("opportunity_score", 0), errors="coerce") or 0.0)
+            winp = float(pd.to_numeric(s.get("win_probability", 0), errors="coerce") or 0.0)
+            exret = float(pd.to_numeric(s.get("expected_return", 0), errors="coerce") or 0.0)
+            fit = str(s.get("strategy_fit", "")).lower().strip()
+            if (
+                symbol
+                and symbol in approved_symbols
+                and fit == "vwap_pullback"
+                and opp >= 65
+                and winp >= 0.52
+                and exret >= 0.0
+            ):
+                execution_candidates.append(s)
+        st.caption(
+            f"Execution universe: {len(execution_candidates)} approved potential stocks "
+            f"(from {len(scored or [])} scored; approved symbols: {len(approved_symbols)})."
+        )
+        if scored and not execution_candidates:
+            st.warning(
+                "No stocks passed backtest-approved potential filter. "
+                "Run Backtest + AI Boost again or relax the filter thresholds."
+            )
         
         # Run allocator
         allocation = engines['allocator'].allocate(
             total_capital=st.session_state.total_capital,
             market_sentiment=sentiment,
-            opportunities=scored
+            opportunities=execution_candidates
         )
         
         # Display allocation
@@ -1849,7 +1958,7 @@ with tab_portfolio:
             with st.spinner("AI selecting best trades..."):
                 # Select trades
                 selected_trades = engines['selector'].select_trades(
-                    opportunities=scored,
+                    opportunities=execution_candidates,
                     allocation=allocation,
                     market_sentiment=sentiment
                 )

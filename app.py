@@ -26,6 +26,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+from typing import Any, Dict
 import logging
 import threading
 
@@ -142,6 +143,102 @@ def _mark_operation_run(op_key: str):
     op_state["count"] = int(op_state.get("count", 0)) + 1
     op_state["last_run_ist"] = datetime.now(IST_ZONE).strftime("%Y-%m-%d %H:%M:%S")
     op_runs[op_key] = op_state
+
+
+def _get_shariah_index_universe(limit: int = 100) -> pd.DataFrame:
+    """
+    Build top halal universe from loaded stocks using latest metrics.
+    Ranking priority: liquidity_score, then turnover proxy (ltp * volume), then symbol.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            s.symbol,
+            s.company,
+            COALESCE(m.ltp, 0) AS ltp,
+            COALESCE(m.volume, 0) AS volume,
+            COALESCE(m.liquidity_score, 0) AS liquidity_score,
+            COALESCE(m.date, '') AS metric_date
+        FROM stocks_master s
+        LEFT JOIN (
+            SELECT m1.*
+            FROM stock_metrics m1
+            INNER JOIN (
+                SELECT symbol, MAX(date) AS max_date
+                FROM stock_metrics
+                GROUP BY symbol
+            ) mx ON mx.symbol = m1.symbol AND mx.max_date = m1.date
+        ) m ON m.symbol = s.symbol
+        WHERE s.is_active = 1
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["ltp"] = pd.to_numeric(df.get("ltp", 0), errors="coerce").fillna(0.0)
+    df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0.0)
+    df["liquidity_score"] = pd.to_numeric(df.get("liquidity_score", 0), errors="coerce").fillna(0.0)
+    df["turnover_proxy"] = df["ltp"] * df["volume"]
+    df = df.sort_values(
+        by=["liquidity_score", "turnover_proxy", "symbol"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    if limit > 0:
+        df = df.head(int(limit))
+    return df
+
+
+def _build_live_shariah_index_from_quotes(
+    universe_df: pd.DataFrame,
+    quotes: Dict[str, Dict],
+    index_name: str,
+    base_value: float = 1000.0,
+) -> Dict[str, Any]:
+    """Compute equal-weight live index from quote percent changes."""
+    if universe_df.empty:
+        return {"index_name": index_name, "index_value": base_value, "change_pct": 0.0, "constituents": pd.DataFrame()}
+
+    rows = []
+    for _, r in universe_df.iterrows():
+        symbol = str(r.get("symbol", "")).upper().strip()
+        if not symbol:
+            continue
+        q = quotes.get(symbol, {}) if isinstance(quotes, dict) else {}
+        last_price = float(pd.to_numeric(q.get("last_price", 0), errors="coerce") or 0.0)
+        ohlc = q.get("ohlc", {}) if isinstance(q.get("ohlc", {}), dict) else {}
+        prev_close = float(pd.to_numeric(ohlc.get("close", 0), errors="coerce") or 0.0)
+        if last_price <= 0:
+            last_price = float(pd.to_numeric(r.get("ltp", 0), errors="coerce") or 0.0)
+        if prev_close <= 0:
+            prev_close = float(pd.to_numeric(r.get("ltp", 0), errors="coerce") or 0.0)
+        change_pct = ((last_price - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+        rows.append(
+            {
+                "symbol": symbol,
+                "company": str(r.get("company", "")),
+                "last_price": last_price,
+                "prev_close": prev_close,
+                "change_pct": change_pct,
+            }
+        )
+
+    cdf = pd.DataFrame(rows)
+    if cdf.empty:
+        return {"index_name": index_name, "index_value": base_value, "change_pct": 0.0, "constituents": cdf}
+
+    idx_change_pct = float(cdf["change_pct"].mean())
+    idx_value = float(base_value * (1.0 + idx_change_pct / 100.0))
+    return {
+        "index_name": index_name,
+        "index_value": idx_value,
+        "change_pct": idx_change_pct,
+        "constituents": cdf.sort_values("change_pct", ascending=False).reset_index(drop=True),
+    }
 
 
 def _get_backtest_approved_symbols(
@@ -853,8 +950,9 @@ with st.sidebar:
         st.caption(f"`{op_key}` v{ver} | runs: {run_count} | last: {run_last}")
 
 # Main navigation tabs
-tab_market, tab_backtest, tab_portfolio, tab_ai = st.tabs([
+tab_market, tab_shariah_index, tab_backtest, tab_portfolio, tab_ai = st.tabs([
     "🔍 Market Intelligence",
+    "📉 Shariah Index",
     "📊 Backtest Review",
     "💼 Portfolio Engine",
     "🤖 AI Lab",
@@ -1638,6 +1736,107 @@ with tab_market:
             st.dataframe(styled_gainers, use_container_width=True, hide_index=True)
     except Exception as exc:
         st.warning(f"Could not load NSE gainers: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARIAH INDEX TAB (LIVE)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_shariah_index:
+    st.markdown("<h1 class='main-header'>📉 Shariah Indices (Live)</h1>", unsafe_allow_html=True)
+    st.markdown("**Nifty-style custom indices from your loaded halal universe**")
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        refresh_sec = st.selectbox("Refresh (seconds)", [15, 30, 60, 120], index=1, key="shariah_index_refresh_sec")
+    with c2:
+        manual_refresh = st.button("🔄 Refresh Now", key="shariah_index_refresh_now")
+    with c3:
+        st.caption("Live prices via Zerodha quote API. Uses top halal stocks ranked by liquidity + turnover.")
+
+    # Auto refresh timer to show data liveliness.
+    if hasattr(st, "autorefresh"):
+        st.autorefresh(interval=int(refresh_sec) * 1000, key="shariah_index_autorefresh")
+    else:
+        st.caption("Auto-refresh timer requires newer Streamlit. Use Refresh Now.")
+    if manual_refresh:
+        st.rerun()
+
+    last_updated_ist = datetime.now(IST_ZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+    st.caption(f"Last updated: {last_updated_ist}")
+
+    try:
+        universe_100 = _get_shariah_index_universe(limit=100)
+        if universe_100.empty:
+            st.info("No active halal stocks loaded yet. Use 'Load Stocks' in Market Intelligence first.")
+        else:
+            universe_50 = universe_100.head(min(50, len(universe_100))).copy()
+
+            live_quotes = {}
+            quote_source = "cached metrics (fallback)"
+            try:
+                z_client = get_zerodha_client()
+                quote_symbols = universe_100["symbol"].dropna().astype(str).str.upper().tolist()
+                live_quotes = z_client.fetch_quotes(quote_symbols) if quote_symbols else {}
+                if live_quotes:
+                    quote_source = "Zerodha live quotes"
+            except Exception as exc:
+                st.warning(f"Live API unavailable, using fallback prices: {exc}")
+
+            idx50 = _build_live_shariah_index_from_quotes(
+                universe_df=universe_50,
+                quotes=live_quotes,
+                index_name="Meezan Shariah 50",
+                base_value=1000.0,
+            )
+            idx100 = _build_live_shariah_index_from_quotes(
+                universe_df=universe_100,
+                quotes=live_quotes,
+                index_name="Meezan Shariah 100",
+                base_value=1000.0,
+            )
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(
+                "Shariah 50",
+                f"{idx50['index_value']:.2f}",
+                f"{idx50['change_pct']:+.2f}%",
+            )
+            m2.metric(
+                "Shariah 100",
+                f"{idx100['index_value']:.2f}",
+                f"{idx100['change_pct']:+.2f}%",
+            )
+            m3.metric("Constituents (50)", len(universe_50))
+            m4.metric("Constituents (100)", len(universe_100))
+            st.caption(f"Data source: {quote_source}")
+
+            def _show_constituents(title: str, cdf: pd.DataFrame, max_rows: int):
+                st.markdown(f"#### {title} Constituents")
+                if cdf.empty:
+                    st.info("No constituents available.")
+                    return
+                show_df = cdf.head(max_rows).copy()
+                show_df = show_df.rename(
+                    columns={
+                        "symbol": "Symbol",
+                        "company": "Company",
+                        "last_price": "Last Price",
+                        "prev_close": "Prev Close",
+                        "change_pct": "Change %",
+                    }
+                )
+                show_df["Last Price"] = pd.to_numeric(show_df["Last Price"], errors="coerce").fillna(0.0).round(2)
+                show_df["Prev Close"] = pd.to_numeric(show_df["Prev Close"], errors="coerce").fillna(0.0).round(2)
+                show_df["Change %"] = pd.to_numeric(show_df["Change %"], errors="coerce").fillna(0.0).round(2)
+                st.dataframe(show_df, use_container_width=True, hide_index=True, height=360)
+
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                _show_constituents("Top Movers - Shariah 50", idx50.get("constituents", pd.DataFrame()), 25)
+            with cc2:
+                _show_constituents("Top Movers - Shariah 100", idx100.get("constituents", pd.DataFrame()), 35)
+    except Exception as exc:
+        st.error(f"Shariah index view unavailable: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

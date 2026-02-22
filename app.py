@@ -19,6 +19,7 @@ current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import requests
@@ -211,19 +212,36 @@ def _build_live_shariah_index_from_quotes(
         q = quotes.get(symbol, {}) if isinstance(quotes, dict) else {}
         last_price = float(pd.to_numeric(q.get("last_price", 0), errors="coerce") or 0.0)
         ohlc = q.get("ohlc", {}) if isinstance(q.get("ohlc", {}), dict) else {}
+        open_px = float(pd.to_numeric(ohlc.get("open", 0), errors="coerce") or 0.0)
+        high_px = float(pd.to_numeric(ohlc.get("high", 0), errors="coerce") or 0.0)
+        low_px = float(pd.to_numeric(ohlc.get("low", 0), errors="coerce") or 0.0)
         prev_close = float(pd.to_numeric(ohlc.get("close", 0), errors="coerce") or 0.0)
+        volume = float(pd.to_numeric(q.get("volume", 0), errors="coerce") or 0.0)
         if last_price <= 0:
             last_price = float(pd.to_numeric(r.get("ltp", 0), errors="coerce") or 0.0)
+        if open_px <= 0:
+            open_px = last_price
+        if high_px <= 0:
+            high_px = max(last_price, open_px)
+        if low_px <= 0:
+            low_px = min(last_price, open_px)
         if prev_close <= 0:
             prev_close = float(pd.to_numeric(r.get("ltp", 0), errors="coerce") or 0.0)
-        change_pct = ((last_price - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+        change_abs = (last_price - prev_close) if prev_close > 0 else 0.0
+        change_pct = ((change_abs / prev_close) * 100.0) if prev_close > 0 else 0.0
         rows.append(
             {
                 "symbol": symbol,
                 "company": str(r.get("company", "")),
+                "open": open_px,
+                "high": high_px,
+                "low": low_px,
                 "last_price": last_price,
                 "prev_close": prev_close,
+                "change_abs": change_abs,
                 "change_pct": change_pct,
+                "volume": volume,
+                "value_crore": (volume * last_price) / 1e7 if volume > 0 and last_price > 0 else 0.0,
             }
         )
 
@@ -239,6 +257,131 @@ def _build_live_shariah_index_from_quotes(
         "change_pct": idx_change_pct,
         "constituents": cdf.sort_values("change_pct", ascending=False).reset_index(drop=True),
     }
+
+
+def _get_shariah_symbol_stats(symbols: list[str]) -> pd.DataFrame:
+    """Fetch 52-week high/low and 30-day change references from cached metrics."""
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "high_52w", "low_52w", "close_30d"])
+    uniq = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
+    if not uniq:
+        return pd.DataFrame(columns=["symbol", "high_52w", "low_52w", "close_30d"])
+
+    conn = get_connection()
+    cur = conn.cursor()
+    ph = ",".join(["?"] * len(uniq))
+    cur.execute(
+        f"""
+        SELECT
+            symbol,
+            MAX(high) AS high_52w,
+            MIN(low) AS low_52w
+        FROM stock_metrics
+        WHERE symbol IN ({ph})
+          AND date >= date('now', '-365 day')
+        GROUP BY symbol
+        """,
+        uniq,
+    )
+    r1 = cur.fetchall()
+    cur.execute(
+        f"""
+        SELECT s.symbol,
+               (
+                 SELECT COALESCE(sm.close, sm.ltp)
+                 FROM stock_metrics sm
+                 WHERE sm.symbol = s.symbol
+                   AND sm.date <= date('now', '-30 day')
+                 ORDER BY sm.date DESC
+                 LIMIT 1
+               ) AS close_30d
+        FROM (
+          SELECT DISTINCT symbol
+          FROM stock_metrics
+          WHERE symbol IN ({ph})
+        ) s
+        """,
+        uniq,
+    )
+    r2 = cur.fetchall()
+    conn.close()
+
+    d1 = pd.DataFrame([dict(r) for r in r1]) if r1 else pd.DataFrame(columns=["symbol", "high_52w", "low_52w"])
+    d2 = pd.DataFrame([dict(r) for r in r2]) if r2 else pd.DataFrame(columns=["symbol", "close_30d"])
+    out = d1.merge(d2, on="symbol", how="outer")
+    return out
+
+
+def _get_shariah_index_history(universe_df: pd.DataFrame, days: int = 120, base_value: float = 1000.0) -> pd.DataFrame:
+    """Build equal-weight historical index series from cached daily metrics."""
+    if universe_df.empty:
+        return pd.DataFrame(columns=["date", "index_value"])
+    symbols = sorted(universe_df["symbol"].dropna().astype(str).str.upper().unique().tolist())
+    if not symbols:
+        return pd.DataFrame(columns=["date", "index_value"])
+    conn = get_connection()
+    cur = conn.cursor()
+    ph = ",".join(["?"] * len(symbols))
+    cur.execute(
+        f"""
+        SELECT date, symbol, open, close, ltp
+        FROM stock_metrics
+        WHERE symbol IN ({ph})
+          AND date >= date('now', ?)
+        ORDER BY date ASC, symbol ASC
+        """,
+        (*symbols, f"-{int(days)} day"),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return pd.DataFrame(columns=["date", "index_value"])
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["open"] = pd.to_numeric(df.get("open", np.nan), errors="coerce")
+    df["close"] = pd.to_numeric(df.get("close", np.nan), errors="coerce")
+    df["ltp"] = pd.to_numeric(df.get("ltp", np.nan), errors="coerce")
+    df["close_eff"] = df["close"].where(df["close"] > 0, df["ltp"])
+    df["open_eff"] = df["open"].where(df["open"] > 0, df["close_eff"])
+    df = df.dropna(subset=["date", "open_eff", "close_eff"])
+    if df.empty:
+        return pd.DataFrame(columns=["date", "index_value"])
+
+    df["ret"] = np.where(df["open_eff"] > 0, (df["close_eff"] - df["open_eff"]) / df["open_eff"], np.nan)
+    daily = df.groupby("date", as_index=False)["ret"].mean()
+    daily["ret"] = daily["ret"].fillna(0.0)
+    daily["index_value"] = base_value * (1.0 + daily["ret"]).cumprod()
+    return daily[["date", "index_value"]]
+
+
+def _get_stock_history(symbol: str, days: int = 120) -> pd.DataFrame:
+    """Fetch stock close history for charting."""
+    sym = str(symbol).upper().strip()
+    if not sym:
+        return pd.DataFrame(columns=["date", "price"])
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT date, close, ltp
+        FROM stock_metrics
+        WHERE symbol = ?
+          AND date >= date('now', ?)
+        ORDER BY date ASC
+        """,
+        (sym, f"-{int(days)} day"),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return pd.DataFrame(columns=["date", "price"])
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["close"] = pd.to_numeric(df.get("close", np.nan), errors="coerce")
+    df["ltp"] = pd.to_numeric(df.get("ltp", np.nan), errors="coerce")
+    df["price"] = df["close"].where(df["close"] > 0, df["ltp"])
+    return df.dropna(subset=["date", "price"])[["date", "price"]]
 
 
 def _get_backtest_approved_symbols(
@@ -1810,22 +1953,54 @@ with tab_shariah_index:
             m4.metric("Constituents (100)", len(universe_100))
             st.caption(f"Data source: {quote_source}")
 
+            symbol_stats = _get_shariah_symbol_stats(universe_100["symbol"].dropna().astype(str).tolist())
+
             def _format_constituents(cdf: pd.DataFrame) -> pd.DataFrame:
                 if cdf.empty:
                     return pd.DataFrame()
                 show_df = cdf.copy()
+                if not symbol_stats.empty:
+                    show_df = show_df.merge(
+                        symbol_stats.rename(columns={"symbol": "symbol"}),
+                        on="symbol",
+                        how="left",
+                    )
+                show_df["pct_30d"] = np.where(
+                    pd.to_numeric(show_df.get("close_30d", np.nan), errors="coerce") > 0,
+                    ((pd.to_numeric(show_df.get("last_price", 0), errors="coerce") - pd.to_numeric(show_df.get("close_30d", 0), errors="coerce"))
+                     / pd.to_numeric(show_df.get("close_30d", 0), errors="coerce")) * 100.0,
+                    np.nan,
+                )
                 show_df = show_df.rename(
                     columns={
                         "symbol": "Symbol",
                         "company": "Company",
+                        "open": "Open",
+                        "high": "High",
+                        "low": "Low",
                         "last_price": "Last Price",
                         "prev_close": "Prev Close",
+                        "change_abs": "Chng",
                         "change_pct": "Change %",
+                        "volume": "Volume (Shares)",
+                        "value_crore": "Value (₹ Cr)",
+                        "high_52w": "52W High",
+                        "low_52w": "52W Low",
+                        "pct_30d": "30D %Chng",
                     }
                 )
+                for price_col in ["Open", "High", "Low", "Prev Close", "Last Price", "Chng", "52W High", "52W Low"]:
+                    if price_col in show_df.columns:
+                        show_df[price_col] = pd.to_numeric(show_df[price_col], errors="coerce").fillna(0.0).round(2)
                 show_df["Last Price"] = pd.to_numeric(show_df["Last Price"], errors="coerce").fillna(0.0).round(2)
                 show_df["Prev Close"] = pd.to_numeric(show_df["Prev Close"], errors="coerce").fillna(0.0).round(2)
                 show_df["Change %"] = pd.to_numeric(show_df["Change %"], errors="coerce").fillna(0.0).round(2)
+                if "Volume (Shares)" in show_df.columns:
+                    show_df["Volume (Shares)"] = pd.to_numeric(show_df["Volume (Shares)"], errors="coerce").fillna(0).astype(int)
+                if "Value (₹ Cr)" in show_df.columns:
+                    show_df["Value (₹ Cr)"] = pd.to_numeric(show_df["Value (₹ Cr)"], errors="coerce").fillna(0.0).round(2)
+                if "30D %Chng" in show_df.columns:
+                    show_df["30D %Chng"] = pd.to_numeric(show_df["30D %Chng"], errors="coerce").round(2)
                 return show_df
 
             cc1, cc2 = st.columns(2)
@@ -1835,14 +2010,14 @@ with tab_shariah_index:
                 if sh50_df.empty:
                     st.info("No Shariah 50 constituents available.")
                 else:
-                    st.dataframe(sh50_df, use_container_width=True, hide_index=True, height=420)
+                    st.dataframe(sh50_df, use_container_width=True, hide_index=True, height=520)
             with cc2:
                 st.markdown("#### Shariah 100 Constituents (All)")
                 sh100_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
                 if sh100_df.empty:
                     st.info("No Shariah 100 constituents available.")
                 else:
-                    st.dataframe(sh100_df, use_container_width=True, hide_index=True, height=520)
+                    st.dataframe(sh100_df, use_container_width=True, hide_index=True, height=620)
 
             st.markdown("#### Top Gainers and Top Losers (Shariah 100)")
             movers_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
@@ -1858,6 +2033,80 @@ with tab_shariah_index:
                     st.markdown("**Top Losers**")
                     top_losers_df = movers_df.sort_values("Change %", ascending=True).head(20)
                     st.dataframe(top_losers_df, use_container_width=True, hide_index=True, height=360)
+
+            st.markdown("#### Chart View")
+            chart_options = ["Meezan Shariah 50", "Meezan Shariah 100"] + universe_100["symbol"].dropna().astype(str).str.upper().tolist()
+            selected_chart = st.selectbox(
+                "Select Index / Stock",
+                chart_options,
+                index=0,
+                key="shariah_chart_selector",
+            )
+            history_days = st.selectbox("History Window", [30, 60, 90, 120, 180], index=3, key="shariah_chart_days")
+
+            if selected_chart == "Meezan Shariah 50":
+                hist_df = _get_shariah_index_history(universe_50, days=int(history_days), base_value=1000.0)
+                y_col = "index_value"
+                y_title = "Index Value"
+            elif selected_chart == "Meezan Shariah 100":
+                hist_df = _get_shariah_index_history(universe_100, days=int(history_days), base_value=1000.0)
+                y_col = "index_value"
+                y_title = "Index Value"
+            else:
+                hist_df = _get_stock_history(selected_chart, days=int(history_days))
+                y_col = "price"
+                y_title = "Price"
+
+            if hist_df.empty:
+                st.info("No historical series available for selected item.")
+            else:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=hist_df["date"],
+                        y=hist_df[y_col],
+                        mode="lines",
+                        name=selected_chart,
+                        line=dict(width=2),
+                    )
+                )
+                fig.update_layout(
+                    title=f"{selected_chart} - {history_days}D",
+                    xaxis_title="Date",
+                    yaxis_title=y_title,
+                    height=420,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            if not selected_chart.startswith("Meezan"):
+                if st.checkbox("Show TradingView (Beta)", value=False, key="show_tradingview_embed"):
+                    tv_symbol = f"NSE:{selected_chart}"
+                    tv_html = f"""
+                    <div class="tradingview-widget-container">
+                      <div id="tradingview_shariah_chart"></div>
+                      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                      <script type="text/javascript">
+                        new TradingView.widget({{
+                          "container_id": "tradingview_shariah_chart",
+                          "symbol": "{tv_symbol}",
+                          "interval": "D",
+                          "timezone": "Asia/Kolkata",
+                          "theme": "dark",
+                          "style": "1",
+                          "locale": "en",
+                          "toolbar_bg": "#111827",
+                          "enable_publishing": false,
+                          "allow_symbol_change": true,
+                          "hide_top_toolbar": false,
+                          "withdateranges": true,
+                          "height": 520,
+                          "width": "100%"
+                        }});
+                      </script>
+                    </div>
+                    """
+                    components.html(tv_html, height=540, scrolling=False)
     except Exception as exc:
         st.error(f"Shariah index view unavailable: {exc}")
 

@@ -159,9 +159,14 @@ def _get_shariah_index_universe(limit: int = 100) -> pd.DataFrame:
             s.symbol,
             s.company,
             COALESCE(m.ltp, 0) AS ltp,
+            COALESCE(m.open, 0) AS open_latest,
+            COALESCE(m.high, 0) AS high_latest,
+            COALESCE(m.low, 0) AS low_latest,
+            COALESCE(m.close, 0) AS close_latest,
             COALESCE(m.volume, 0) AS volume,
             COALESCE(m.liquidity_score, 0) AS liquidity_score,
-            COALESCE(m.date, '') AS metric_date
+            COALESCE(m.date, '') AS metric_date,
+            COALESCE(m.updated_at, '') AS metric_updated_at
         FROM stocks_master s
         LEFT JOIN (
             SELECT m1.*
@@ -220,19 +225,23 @@ def _build_live_shariah_index_from_quotes(
         if last_price <= 0:
             last_price = float(pd.to_numeric(r.get("ltp", 0), errors="coerce") or 0.0)
         if open_px <= 0:
-            open_px = last_price
+            open_px = float(pd.to_numeric(r.get("open_latest", 0), errors="coerce") or 0.0) or last_price
         if high_px <= 0:
-            high_px = max(last_price, open_px)
+            high_px = float(pd.to_numeric(r.get("high_latest", 0), errors="coerce") or 0.0) or max(last_price, open_px)
         if low_px <= 0:
-            low_px = min(last_price, open_px)
+            low_px = float(pd.to_numeric(r.get("low_latest", 0), errors="coerce") or 0.0) or min(last_price, open_px)
         if prev_close <= 0:
-            prev_close = float(pd.to_numeric(r.get("ltp", 0), errors="coerce") or 0.0)
+            prev_close = float(pd.to_numeric(r.get("close_latest", 0), errors="coerce") or 0.0)
+            if prev_close <= 0:
+                prev_close = float(pd.to_numeric(r.get("ltp", 0), errors="coerce") or 0.0)
         change_abs = (last_price - prev_close) if prev_close > 0 else 0.0
         change_pct = ((change_abs / prev_close) * 100.0) if prev_close > 0 else 0.0
         rows.append(
             {
                 "symbol": symbol,
                 "company": str(r.get("company", "")),
+                "metric_date": str(r.get("metric_date", "")),
+                "metric_updated_at": str(r.get("metric_updated_at", "")),
                 "open": open_px,
                 "high": high_px,
                 "low": low_px,
@@ -1900,7 +1909,17 @@ with tab_shariah_index:
     if hasattr(st, "autorefresh"):
         st.autorefresh(interval=int(refresh_sec) * 1000, key="shariah_index_autorefresh")
     else:
-        st.caption("Auto-refresh timer requires newer Streamlit. Use Refresh Now.")
+        components.html(
+            f"""
+            <script>
+            setTimeout(function() {{
+                window.parent.location.reload();
+            }}, {int(refresh_sec) * 1000});
+            </script>
+            """,
+            height=0,
+        )
+        st.caption(f"Auto-refresh active via browser timer ({int(refresh_sec)}s).")
     if manual_refresh:
         st.rerun()
 
@@ -1915,15 +1934,21 @@ with tab_shariah_index:
             universe_50 = universe_100.head(min(50, len(universe_100))).copy()
 
             live_quotes = {}
-            quote_source = "cached metrics (fallback)"
-            try:
-                z_client = get_zerodha_client()
-                quote_symbols = universe_100["symbol"].dropna().astype(str).str.upper().tolist()
-                live_quotes = z_client.fetch_quotes(quote_symbols) if quote_symbols else {}
-                if live_quotes:
-                    quote_source = "Zerodha live quotes"
-            except Exception as exc:
-                st.warning(f"Live API unavailable, using fallback prices: {exc}")
+            market_live = _is_live_market_hours(datetime.now(IST_ZONE))
+            quote_source = "last known cached metrics"
+            if market_live:
+                try:
+                    z_client = get_zerodha_client()
+                    quote_symbols = universe_100["symbol"].dropna().astype(str).str.upper().tolist()
+                    live_quotes = z_client.fetch_quotes(quote_symbols) if quote_symbols else {}
+                    if live_quotes:
+                        quote_source = "Zerodha live quotes"
+                    else:
+                        quote_source = "last known cached metrics (no live quote payload)"
+                except Exception as exc:
+                    st.warning(f"Live API unavailable, using last known metrics: {exc}")
+            else:
+                st.info("Market is currently closed. Showing last known metrics from database.")
 
             idx50 = _build_live_shariah_index_from_quotes(
                 universe_df=universe_50,
@@ -1951,7 +1976,23 @@ with tab_shariah_index:
             )
             m3.metric("Constituents (50)", len(universe_50))
             m4.metric("Constituents (100)", len(universe_100))
-            st.caption(f"Data source: {quote_source}")
+            latest_metric_ist = ""
+            try:
+                metric_updates = (
+                    idx100.get("constituents", pd.DataFrame()).get("metric_updated_at")
+                    if isinstance(idx100.get("constituents", pd.DataFrame()), pd.DataFrame)
+                    else None
+                )
+                if metric_updates is not None:
+                    cleaned = [str(v).strip() for v in metric_updates.tolist() if str(v).strip()]
+                    if cleaned:
+                        latest_metric_ist = _format_utc_to_ist(max(cleaned))
+            except Exception:
+                latest_metric_ist = ""
+            if latest_metric_ist:
+                st.caption(f"Data source: {quote_source} | Last metric update: {latest_metric_ist}")
+            else:
+                st.caption(f"Data source: {quote_source}")
 
             symbol_stats = _get_shariah_symbol_stats(universe_100["symbol"].dropna().astype(str).tolist())
 

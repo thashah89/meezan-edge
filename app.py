@@ -2003,21 +2003,19 @@ with tab_shariah_index:
                     show_df["30D %Chng"] = pd.to_numeric(show_df["30D %Chng"], errors="coerce").round(2)
                 return show_df
 
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                st.markdown("#### Shariah 50 Constituents (All)")
-                sh50_df = _format_constituents(idx50.get("constituents", pd.DataFrame()))
-                if sh50_df.empty:
-                    st.info("No Shariah 50 constituents available.")
-                else:
-                    st.dataframe(sh50_df, use_container_width=True, hide_index=True, height=520)
-            with cc2:
-                st.markdown("#### Shariah 100 Constituents (All)")
-                sh100_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
-                if sh100_df.empty:
-                    st.info("No Shariah 100 constituents available.")
-                else:
-                    st.dataframe(sh100_df, use_container_width=True, hide_index=True, height=620)
+            st.markdown("#### Shariah 50 Constituents (All)")
+            sh50_df = _format_constituents(idx50.get("constituents", pd.DataFrame()))
+            if sh50_df.empty:
+                st.info("No Shariah 50 constituents available.")
+            else:
+                st.dataframe(sh50_df, use_container_width=True, hide_index=True, height=620)
+
+            st.markdown("#### Shariah 100 Constituents (All)")
+            sh100_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
+            if sh100_df.empty:
+                st.info("No Shariah 100 constituents available.")
+            else:
+                st.dataframe(sh100_df, use_container_width=True, hide_index=True, height=620)
 
             st.markdown("#### Top Gainers and Top Losers (Shariah 100)")
             movers_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))

@@ -1905,249 +1905,249 @@ with tab_shariah_index:
     with c3:
         st.caption("Live prices via Zerodha quote API. Uses top halal stocks ranked by liquidity + turnover.")
 
-    # Auto refresh timer to show data liveliness.
-    if hasattr(st, "autorefresh"):
-        st.autorefresh(interval=int(refresh_sec) * 1000, key="shariah_index_autorefresh")
-    else:
-        components.html(
-            f"""
-            <script>
-            setTimeout(function() {{
-                window.parent.location.reload();
-            }}, {int(refresh_sec) * 1000});
-            </script>
-            """,
-            height=0,
-        )
-        st.caption(f"Auto-refresh active via browser timer ({int(refresh_sec)}s).")
+    # Prefer fragment refresh so only this section reruns.
     if manual_refresh:
         st.rerun()
 
-    last_updated_ist = datetime.now(IST_ZONE).strftime("%Y-%m-%d %H:%M:%S IST")
-    st.caption(f"Last updated: {last_updated_ist}")
+    def _render_shariah_live_section():
+        last_updated_ist = datetime.now(IST_ZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+        st.caption(f"Last updated: {last_updated_ist}")
 
-    try:
-        universe_100 = _get_shariah_index_universe(limit=100)
-        if universe_100.empty:
-            st.info("No active halal stocks loaded yet. Use 'Load Stocks' in Market Intelligence first.")
-        else:
-            universe_50 = universe_100.head(min(50, len(universe_100))).copy()
-
-            live_quotes = {}
-            market_live = _is_live_market_hours(datetime.now(IST_ZONE))
-            quote_source = "last known cached metrics"
-            if market_live:
-                try:
-                    z_client = get_zerodha_client()
-                    quote_symbols = universe_100["symbol"].dropna().astype(str).str.upper().tolist()
-                    live_quotes = z_client.fetch_quotes(quote_symbols) if quote_symbols else {}
-                    if live_quotes:
-                        quote_source = "Zerodha live quotes"
-                    else:
-                        quote_source = "last known cached metrics (no live quote payload)"
-                except Exception as exc:
-                    st.warning(f"Live API unavailable, using last known metrics: {exc}")
+        try:
+            universe_100 = _get_shariah_index_universe(limit=100)
+            if universe_100.empty:
+                st.info("No active halal stocks loaded yet. Use 'Load Stocks' in Market Intelligence first.")
             else:
-                st.info("Market is currently closed. Showing last known metrics from database.")
+                universe_50 = universe_100.head(min(50, len(universe_100))).copy()
 
-            idx50 = _build_live_shariah_index_from_quotes(
-                universe_df=universe_50,
-                quotes=live_quotes,
-                index_name="Meezan Shariah 50",
-                base_value=1000.0,
-            )
-            idx100 = _build_live_shariah_index_from_quotes(
-                universe_df=universe_100,
-                quotes=live_quotes,
-                index_name="Meezan Shariah 100",
-                base_value=1000.0,
-            )
+                live_quotes = {}
+                market_live = _is_live_market_hours(datetime.now(IST_ZONE))
+                quote_source = "last known cached metrics"
+                if market_live:
+                    try:
+                        z_client = get_zerodha_client()
+                        quote_symbols = universe_100["symbol"].dropna().astype(str).str.upper().tolist()
+                        live_quotes = z_client.fetch_quotes(quote_symbols) if quote_symbols else {}
+                        if live_quotes:
+                            quote_source = "Zerodha live quotes"
+                        else:
+                            quote_source = "last known cached metrics (no live quote payload)"
+                    except Exception as exc:
+                        st.warning(f"Live API unavailable, using last known metrics: {exc}")
+                else:
+                    st.info("Market is currently closed. Showing last known metrics from database.")
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric(
-                "Shariah 50",
-                f"{idx50['index_value']:.2f}",
-                f"{idx50['change_pct']:+.2f}%",
-            )
-            m2.metric(
-                "Shariah 100",
-                f"{idx100['index_value']:.2f}",
-                f"{idx100['change_pct']:+.2f}%",
-            )
-            m3.metric("Constituents (50)", len(universe_50))
-            m4.metric("Constituents (100)", len(universe_100))
-            latest_metric_ist = ""
-            try:
-                metric_updates = (
-                    idx100.get("constituents", pd.DataFrame()).get("metric_updated_at")
-                    if isinstance(idx100.get("constituents", pd.DataFrame()), pd.DataFrame)
-                    else None
+                idx50 = _build_live_shariah_index_from_quotes(
+                    universe_df=universe_50,
+                    quotes=live_quotes,
+                    index_name="Meezan Shariah 50",
+                    base_value=1000.0,
                 )
-                if metric_updates is not None:
-                    cleaned = [str(v).strip() for v in metric_updates.tolist() if str(v).strip()]
-                    if cleaned:
-                        latest_metric_ist = _format_utc_to_ist(max(cleaned))
-            except Exception:
+                idx100 = _build_live_shariah_index_from_quotes(
+                    universe_df=universe_100,
+                    quotes=live_quotes,
+                    index_name="Meezan Shariah 100",
+                    base_value=1000.0,
+                )
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric(
+                    "Shariah 50",
+                    f"{idx50['index_value']:.2f}",
+                    f"{idx50['change_pct']:+.2f}%",
+                )
+                m2.metric(
+                    "Shariah 100",
+                    f"{idx100['index_value']:.2f}",
+                    f"{idx100['change_pct']:+.2f}%",
+                )
+                m3.metric("Constituents (50)", len(universe_50))
+                m4.metric("Constituents (100)", len(universe_100))
                 latest_metric_ist = ""
-            if latest_metric_ist:
-                st.caption(f"Data source: {quote_source} | Last metric update: {latest_metric_ist}")
-            else:
-                st.caption(f"Data source: {quote_source}")
-
-            symbol_stats = _get_shariah_symbol_stats(universe_100["symbol"].dropna().astype(str).tolist())
-
-            def _format_constituents(cdf: pd.DataFrame) -> pd.DataFrame:
-                if cdf.empty:
-                    return pd.DataFrame()
-                show_df = cdf.copy()
-                if not symbol_stats.empty:
-                    show_df = show_df.merge(
-                        symbol_stats.rename(columns={"symbol": "symbol"}),
-                        on="symbol",
-                        how="left",
+                try:
+                    metric_updates = (
+                        idx100.get("constituents", pd.DataFrame()).get("metric_updated_at")
+                        if isinstance(idx100.get("constituents", pd.DataFrame()), pd.DataFrame)
+                        else None
                     )
-                show_df["pct_30d"] = np.where(
-                    pd.to_numeric(show_df.get("close_30d", np.nan), errors="coerce") > 0,
-                    ((pd.to_numeric(show_df.get("last_price", 0), errors="coerce") - pd.to_numeric(show_df.get("close_30d", 0), errors="coerce"))
-                     / pd.to_numeric(show_df.get("close_30d", 0), errors="coerce")) * 100.0,
-                    np.nan,
-                )
-                show_df = show_df.rename(
-                    columns={
-                        "symbol": "Symbol",
-                        "company": "Company",
-                        "open": "Open",
-                        "high": "High",
-                        "low": "Low",
-                        "last_price": "Last Price",
-                        "prev_close": "Prev Close",
-                        "change_abs": "Chng",
-                        "change_pct": "Change %",
-                        "volume": "Volume (Shares)",
-                        "value_crore": "Value (₹ Cr)",
-                        "high_52w": "52W High",
-                        "low_52w": "52W Low",
-                        "pct_30d": "30D %Chng",
-                    }
-                )
-                for price_col in ["Open", "High", "Low", "Prev Close", "Last Price", "Chng", "52W High", "52W Low"]:
-                    if price_col in show_df.columns:
-                        show_df[price_col] = pd.to_numeric(show_df[price_col], errors="coerce").fillna(0.0).round(2)
-                show_df["Last Price"] = pd.to_numeric(show_df["Last Price"], errors="coerce").fillna(0.0).round(2)
-                show_df["Prev Close"] = pd.to_numeric(show_df["Prev Close"], errors="coerce").fillna(0.0).round(2)
-                show_df["Change %"] = pd.to_numeric(show_df["Change %"], errors="coerce").fillna(0.0).round(2)
-                if "Volume (Shares)" in show_df.columns:
-                    show_df["Volume (Shares)"] = pd.to_numeric(show_df["Volume (Shares)"], errors="coerce").fillna(0).astype(int)
-                if "Value (₹ Cr)" in show_df.columns:
-                    show_df["Value (₹ Cr)"] = pd.to_numeric(show_df["Value (₹ Cr)"], errors="coerce").fillna(0.0).round(2)
-                if "30D %Chng" in show_df.columns:
-                    show_df["30D %Chng"] = pd.to_numeric(show_df["30D %Chng"], errors="coerce").round(2)
-                return show_df
+                    if metric_updates is not None:
+                        cleaned = [str(v).strip() for v in metric_updates.tolist() if str(v).strip()]
+                        if cleaned:
+                            latest_metric_ist = _format_utc_to_ist(max(cleaned))
+                except Exception:
+                    latest_metric_ist = ""
+                if latest_metric_ist:
+                    st.caption(f"Data source: {quote_source} | Last metric update: {latest_metric_ist}")
+                else:
+                    st.caption(f"Data source: {quote_source}")
 
-            st.markdown("#### Shariah 50 Constituents (All)")
-            sh50_df = _format_constituents(idx50.get("constituents", pd.DataFrame()))
-            if sh50_df.empty:
-                st.info("No Shariah 50 constituents available.")
-            else:
-                st.dataframe(sh50_df, use_container_width=True, hide_index=True, height=620)
+                symbol_stats = _get_shariah_symbol_stats(universe_100["symbol"].dropna().astype(str).tolist())
 
-            st.markdown("#### Shariah 100 Constituents (All)")
-            sh100_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
-            if sh100_df.empty:
-                st.info("No Shariah 100 constituents available.")
-            else:
-                st.dataframe(sh100_df, use_container_width=True, hide_index=True, height=620)
-
-            st.markdown("#### Top Gainers and Top Losers (Shariah 100)")
-            movers_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
-            if movers_df.empty:
-                st.info("No mover data available.")
-            else:
-                gcol, lcol = st.columns(2)
-                with gcol:
-                    st.markdown("**Top Gainers**")
-                    top_gainers_df = movers_df.sort_values("Change %", ascending=False).head(20)
-                    st.dataframe(top_gainers_df, use_container_width=True, hide_index=True, height=360)
-                with lcol:
-                    st.markdown("**Top Losers**")
-                    top_losers_df = movers_df.sort_values("Change %", ascending=True).head(20)
-                    st.dataframe(top_losers_df, use_container_width=True, hide_index=True, height=360)
-
-            st.markdown("#### Chart View")
-            chart_options = ["Meezan Shariah 50", "Meezan Shariah 100"] + universe_100["symbol"].dropna().astype(str).str.upper().tolist()
-            selected_chart = st.selectbox(
-                "Select Index / Stock",
-                chart_options,
-                index=0,
-                key="shariah_chart_selector",
-            )
-            history_days = st.selectbox("History Window", [30, 60, 90, 120, 180], index=3, key="shariah_chart_days")
-
-            if selected_chart == "Meezan Shariah 50":
-                hist_df = _get_shariah_index_history(universe_50, days=int(history_days), base_value=1000.0)
-                y_col = "index_value"
-                y_title = "Index Value"
-            elif selected_chart == "Meezan Shariah 100":
-                hist_df = _get_shariah_index_history(universe_100, days=int(history_days), base_value=1000.0)
-                y_col = "index_value"
-                y_title = "Index Value"
-            else:
-                hist_df = _get_stock_history(selected_chart, days=int(history_days))
-                y_col = "price"
-                y_title = "Price"
-
-            if hist_df.empty:
-                st.info("No historical series available for selected item.")
-            else:
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Scatter(
-                        x=hist_df["date"],
-                        y=hist_df[y_col],
-                        mode="lines",
-                        name=selected_chart,
-                        line=dict(width=2),
+                def _format_constituents(cdf: pd.DataFrame) -> pd.DataFrame:
+                    if cdf.empty:
+                        return pd.DataFrame()
+                    show_df = cdf.copy()
+                    if not symbol_stats.empty:
+                        show_df = show_df.merge(
+                            symbol_stats.rename(columns={"symbol": "symbol"}),
+                            on="symbol",
+                            how="left",
+                        )
+                    show_df["pct_30d"] = np.where(
+                        pd.to_numeric(show_df.get("close_30d", np.nan), errors="coerce") > 0,
+                        ((pd.to_numeric(show_df.get("last_price", 0), errors="coerce") - pd.to_numeric(show_df.get("close_30d", 0), errors="coerce"))
+                         / pd.to_numeric(show_df.get("close_30d", 0), errors="coerce")) * 100.0,
+                        np.nan,
                     )
-                )
-                fig.update_layout(
-                    title=f"{selected_chart} - {history_days}D",
-                    xaxis_title="Date",
-                    yaxis_title=y_title,
-                    height=420,
-                    margin=dict(l=10, r=10, t=40, b=10),
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                    show_df = show_df.rename(
+                        columns={
+                            "symbol": "Symbol",
+                            "company": "Company",
+                            "open": "Open",
+                            "high": "High",
+                            "low": "Low",
+                            "last_price": "Last Price",
+                            "prev_close": "Prev Close",
+                            "change_abs": "Chng",
+                            "change_pct": "Change %",
+                            "volume": "Volume (Shares)",
+                            "value_crore": "Value (₹ Cr)",
+                            "high_52w": "52W High",
+                            "low_52w": "52W Low",
+                            "pct_30d": "30D %Chng",
+                        }
+                    )
+                    for price_col in ["Open", "High", "Low", "Prev Close", "Last Price", "Chng", "52W High", "52W Low"]:
+                        if price_col in show_df.columns:
+                            show_df[price_col] = pd.to_numeric(show_df[price_col], errors="coerce").fillna(0.0).round(2)
+                    show_df["Last Price"] = pd.to_numeric(show_df["Last Price"], errors="coerce").fillna(0.0).round(2)
+                    show_df["Prev Close"] = pd.to_numeric(show_df["Prev Close"], errors="coerce").fillna(0.0).round(2)
+                    show_df["Change %"] = pd.to_numeric(show_df["Change %"], errors="coerce").fillna(0.0).round(2)
+                    if "Volume (Shares)" in show_df.columns:
+                        show_df["Volume (Shares)"] = pd.to_numeric(show_df["Volume (Shares)"], errors="coerce").fillna(0).astype(int)
+                    if "Value (₹ Cr)" in show_df.columns:
+                        show_df["Value (₹ Cr)"] = pd.to_numeric(show_df["Value (₹ Cr)"], errors="coerce").fillna(0.0).round(2)
+                    if "30D %Chng" in show_df.columns:
+                        show_df["30D %Chng"] = pd.to_numeric(show_df["30D %Chng"], errors="coerce").round(2)
+                    return show_df
 
-            if not selected_chart.startswith("Meezan"):
-                if st.checkbox("Show TradingView (Beta)", value=False, key="show_tradingview_embed"):
-                    tv_symbol = f"NSE:{selected_chart}"
-                    tv_html = f"""
-                    <div class="tradingview-widget-container">
-                      <div id="tradingview_shariah_chart"></div>
-                      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-                      <script type="text/javascript">
-                        new TradingView.widget({{
-                          "container_id": "tradingview_shariah_chart",
-                          "symbol": "{tv_symbol}",
-                          "interval": "D",
-                          "timezone": "Asia/Kolkata",
-                          "theme": "dark",
-                          "style": "1",
-                          "locale": "en",
-                          "toolbar_bg": "#111827",
-                          "enable_publishing": false,
-                          "allow_symbol_change": true,
-                          "hide_top_toolbar": false,
-                          "withdateranges": true,
-                          "height": 520,
-                          "width": "100%"
-                        }});
-                      </script>
-                    </div>
-                    """
-                    components.html(tv_html, height=540, scrolling=False)
-    except Exception as exc:
-        st.error(f"Shariah index view unavailable: {exc}")
+                st.markdown("#### Shariah 50 Constituents (All)")
+                sh50_df = _format_constituents(idx50.get("constituents", pd.DataFrame()))
+                if sh50_df.empty:
+                    st.info("No Shariah 50 constituents available.")
+                else:
+                    st.dataframe(sh50_df, use_container_width=True, hide_index=True, height=620)
+
+                st.markdown("#### Shariah 100 Constituents (All)")
+                sh100_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
+                if sh100_df.empty:
+                    st.info("No Shariah 100 constituents available.")
+                else:
+                    st.dataframe(sh100_df, use_container_width=True, hide_index=True, height=620)
+
+                st.markdown("#### Top Gainers and Top Losers (Shariah 100)")
+                movers_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
+                if movers_df.empty:
+                    st.info("No mover data available.")
+                else:
+                    gcol, lcol = st.columns(2)
+                    with gcol:
+                        st.markdown("**Top Gainers**")
+                        top_gainers_df = movers_df.sort_values("Change %", ascending=False).head(20)
+                        st.dataframe(top_gainers_df, use_container_width=True, hide_index=True, height=360)
+                    with lcol:
+                        st.markdown("**Top Losers**")
+                        top_losers_df = movers_df.sort_values("Change %", ascending=True).head(20)
+                        st.dataframe(top_losers_df, use_container_width=True, hide_index=True, height=360)
+
+                st.markdown("#### Chart View")
+                chart_options = ["Meezan Shariah 50", "Meezan Shariah 100"] + universe_100["symbol"].dropna().astype(str).str.upper().tolist()
+                selected_chart = st.selectbox(
+                    "Select Index / Stock",
+                    chart_options,
+                    index=0,
+                    key="shariah_chart_selector",
+                )
+                history_days = st.selectbox("History Window", [30, 60, 90, 120, 180], index=3, key="shariah_chart_days")
+
+                if selected_chart == "Meezan Shariah 50":
+                    hist_df = _get_shariah_index_history(universe_50, days=int(history_days), base_value=1000.0)
+                    y_col = "index_value"
+                    y_title = "Index Value"
+                elif selected_chart == "Meezan Shariah 100":
+                    hist_df = _get_shariah_index_history(universe_100, days=int(history_days), base_value=1000.0)
+                    y_col = "index_value"
+                    y_title = "Index Value"
+                else:
+                    hist_df = _get_stock_history(selected_chart, days=int(history_days))
+                    y_col = "price"
+                    y_title = "Price"
+
+                if hist_df.empty:
+                    st.info("No historical series available for selected item.")
+                else:
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=hist_df["date"],
+                            y=hist_df[y_col],
+                            mode="lines",
+                            name=selected_chart,
+                            line=dict(width=2),
+                        )
+                    )
+                    fig.update_layout(
+                        title=f"{selected_chart} - {history_days}D",
+                        xaxis_title="Date",
+                        yaxis_title=y_title,
+                        height=420,
+                        margin=dict(l=10, r=10, t=40, b=10),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                if not selected_chart.startswith("Meezan"):
+                    if st.checkbox("Show TradingView (Beta)", value=False, key="show_tradingview_embed"):
+                        tv_symbol = f"NSE:{selected_chart}"
+                        tv_html = f"""
+                        <div class="tradingview-widget-container">
+                          <div id="tradingview_shariah_chart"></div>
+                          <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                          <script type="text/javascript">
+                            new TradingView.widget({{
+                              "container_id": "tradingview_shariah_chart",
+                              "symbol": "{tv_symbol}",
+                              "interval": "D",
+                              "timezone": "Asia/Kolkata",
+                              "theme": "dark",
+                              "style": "1",
+                              "locale": "en",
+                              "toolbar_bg": "#111827",
+                              "enable_publishing": false,
+                              "allow_symbol_change": true,
+                              "hide_top_toolbar": false,
+                              "withdateranges": true,
+                              "height": 520,
+                              "width": "100%"
+                            }});
+                          </script>
+                        </div>
+                        """
+                        components.html(tv_html, height=540, scrolling=False)
+        except Exception as exc:
+            st.error(f"Shariah index view unavailable: {exc}")
+
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every=f"{int(refresh_sec)}s")
+        def _shariah_fragment():
+            _render_shariah_live_section()
+        _shariah_fragment()
+        st.caption(f"Background refresh active for Shariah section ({int(refresh_sec)}s).")
+    else:
+        # Legacy fallback: this may trigger full reruns on older Streamlit versions.
+        if hasattr(st, "autorefresh"):
+            st.autorefresh(interval=int(refresh_sec) * 1000, key="shariah_index_autorefresh")
+        _render_shariah_live_section()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════

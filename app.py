@@ -1454,9 +1454,175 @@ with tab_market:
             st.info("No backtest report found yet. Run 'Backtest + AI Boost' first.")
     except Exception as exc:
         st.warning(f"Backtest report unavailable: {exc}")
-    
+
     st.markdown("---")
-    
+    st.subheader("📅 90-Day Daily Trend and Top Performers")
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT date, symbol, open, close
+            FROM stock_metrics
+            WHERE date >= date('now', '-90 day')
+              AND open IS NOT NULL
+              AND close IS NOT NULL
+              AND open > 0
+              AND close > 0
+            ORDER BY date DESC, symbol ASC
+            """
+        )
+        metric_rows_90d = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT run_id
+            FROM backtest_trades
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        latest_row = cursor.fetchone()
+        latest_run_id = latest_row["run_id"] if latest_row else None
+
+        run_rows = []
+        if latest_run_id:
+            cursor.execute(
+                """
+                SELECT entry_date, strategy_name, return_pct
+                FROM backtest_trades
+                WHERE run_id = ?
+                  AND entry_date IS NOT NULL
+                  AND return_pct IS NOT NULL
+                """,
+                (latest_run_id,),
+            )
+            run_rows = cursor.fetchall()
+        conn.close()
+
+        if metric_rows_90d:
+            trend_df = pd.DataFrame([dict(r) for r in metric_rows_90d])
+            trend_df["date"] = pd.to_datetime(trend_df["date"], errors="coerce")
+            trend_df["open"] = pd.to_numeric(trend_df["open"], errors="coerce")
+            trend_df["close"] = pd.to_numeric(trend_df["close"], errors="coerce")
+            trend_df = trend_df.dropna(subset=["date", "open", "close"]).copy()
+            trend_df["day_return_pct"] = np.where(
+                trend_df["open"] > 0,
+                ((trend_df["close"] - trend_df["open"]) / trend_df["open"]) * 100.0,
+                np.nan,
+            )
+            trend_df = trend_df.dropna(subset=["day_return_pct"])
+
+            if not trend_df.empty:
+                daily_summary = (
+                    trend_df.groupby("date", as_index=False)
+                    .agg(
+                        avg_day_return_pct=("day_return_pct", "mean"),
+                        median_day_return_pct=("day_return_pct", "median"),
+                        traded_stocks=("symbol", "nunique"),
+                        gainers=("day_return_pct", lambda s: int((s > 0).sum())),
+                        losers=("day_return_pct", lambda s: int((s < 0).sum())),
+                    )
+                )
+
+                def _trend_label(v: float) -> str:
+                    if v >= 0.35:
+                        return "Bullish"
+                    if v <= -0.35:
+                        return "Bearish"
+                    return "Sideways"
+
+                daily_summary["day_trend"] = daily_summary["avg_day_return_pct"].apply(_trend_label)
+
+                top_per_day = (
+                    trend_df.sort_values(["date", "day_return_pct"], ascending=[False, False])
+                    .groupby("date")
+                    .head(3)
+                    .copy()
+                )
+                top_per_day["stock_line"] = top_per_day.apply(
+                    lambda r: f"{str(r['symbol']).upper()} ({float(r['day_return_pct']):+.2f}%)",
+                    axis=1,
+                )
+                top_stock_map = (
+                    top_per_day.groupby("date")["stock_line"]
+                    .apply(lambda s: ", ".join(s.tolist()))
+                    .to_dict()
+                )
+                daily_summary["high_performing_stocks"] = daily_summary["date"].map(top_stock_map).fillna("-")
+
+                if run_rows:
+                    run_df = pd.DataFrame([dict(r) for r in run_rows])
+                    run_df["entry_date"] = pd.to_datetime(run_df["entry_date"], errors="coerce")
+                    run_df["return_pct"] = pd.to_numeric(run_df["return_pct"], errors="coerce").fillna(0.0)
+                    run_df = run_df.dropna(subset=["entry_date"]).copy()
+                    if not run_df.empty:
+                        strat_day = (
+                            run_df.groupby(["entry_date", "strategy_name"], as_index=False)
+                            .agg(
+                                day_strategy_return_pct=("return_pct", "sum"),
+                                day_strategy_trades=("return_pct", "count"),
+                            )
+                        )
+                        best_strat_day = strat_day.sort_values(
+                            ["entry_date", "day_strategy_return_pct"],
+                            ascending=[False, False],
+                        ).groupby("entry_date", as_index=False).head(1)
+                        best_strat_day = best_strat_day.rename(
+                            columns={
+                                "entry_date": "date",
+                                "strategy_name": "best_strategy",
+                            }
+                        )
+                        daily_summary = daily_summary.merge(
+                            best_strat_day[["date", "best_strategy", "day_strategy_return_pct", "day_strategy_trades"]],
+                            on="date",
+                            how="left",
+                        )
+                    else:
+                        daily_summary["best_strategy"] = "n/a"
+                        daily_summary["day_strategy_return_pct"] = np.nan
+                        daily_summary["day_strategy_trades"] = 0
+                else:
+                    daily_summary["best_strategy"] = "n/a"
+                    daily_summary["day_strategy_return_pct"] = np.nan
+                    daily_summary["day_strategy_trades"] = 0
+
+                daily_summary = daily_summary.sort_values("date", ascending=False).copy()
+                show_daily = pd.DataFrame(
+                    {
+                        "Date": daily_summary["date"].dt.strftime("%Y-%m-%d"),
+                        "Day Trend": daily_summary["day_trend"],
+                        "Avg Day Return %": daily_summary["avg_day_return_pct"].round(2),
+                        "Median Day Return %": daily_summary["median_day_return_pct"].round(2),
+                        "Traded Stocks": daily_summary["traded_stocks"].astype(int),
+                        "Gainers": daily_summary["gainers"].astype(int),
+                        "Losers": daily_summary["losers"].astype(int),
+                        "High Performing Stocks": daily_summary["high_performing_stocks"],
+                        "Best Strategy (Latest Run)": daily_summary["best_strategy"].fillna("n/a").astype(str),
+                        "Strategy Return %": pd.to_numeric(
+                            daily_summary["day_strategy_return_pct"], errors="coerce"
+                        ).round(2),
+                        "Strategy Trades": pd.to_numeric(
+                            daily_summary["day_strategy_trades"], errors="coerce"
+                        ).fillna(0).astype(int),
+                    }
+                )
+                st.dataframe(show_daily, use_container_width=True, hide_index=True, height=380)
+                if latest_run_id:
+                    st.caption(f"Strategy mapping uses latest backtest run: `{latest_run_id}`")
+                else:
+                    st.caption("No backtest run found yet for strategy mapping columns.")
+            else:
+                st.info("Not enough recent market metrics to build 90-day trend table yet.")
+        else:
+            st.info("No stock metrics found for the last 90 days.")
+    except Exception as exc:
+        st.warning(f"Daily trend table unavailable: {exc}")
+
+    st.markdown("---")
+
     st.markdown("---")
     st.subheader("📈 NSE Top Gainers (All)")
     try:

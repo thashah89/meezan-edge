@@ -950,9 +950,9 @@ with st.sidebar:
         st.caption(f"`{op_key}` v{ver} | runs: {run_count} | last: {run_last}")
 
 # Main navigation tabs
-tab_market, tab_shariah_index, tab_backtest, tab_portfolio, tab_ai = st.tabs([
-    "🔍 Market Intelligence",
+tab_shariah_index, tab_market, tab_backtest, tab_portfolio, tab_ai = st.tabs([
     "📉 Shariah Index",
+    "🔍 Market Intelligence",
     "📊 Backtest Review",
     "💼 Portfolio Engine",
     "🤖 AI Lab",

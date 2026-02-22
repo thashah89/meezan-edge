@@ -1810,12 +1810,10 @@ with tab_shariah_index:
             m4.metric("Constituents (100)", len(universe_100))
             st.caption(f"Data source: {quote_source}")
 
-            def _show_constituents(title: str, cdf: pd.DataFrame, max_rows: int):
-                st.markdown(f"#### {title} Constituents")
+            def _format_constituents(cdf: pd.DataFrame) -> pd.DataFrame:
                 if cdf.empty:
-                    st.info("No constituents available.")
-                    return
-                show_df = cdf.head(max_rows).copy()
+                    return pd.DataFrame()
+                show_df = cdf.copy()
                 show_df = show_df.rename(
                     columns={
                         "symbol": "Symbol",
@@ -1828,13 +1826,38 @@ with tab_shariah_index:
                 show_df["Last Price"] = pd.to_numeric(show_df["Last Price"], errors="coerce").fillna(0.0).round(2)
                 show_df["Prev Close"] = pd.to_numeric(show_df["Prev Close"], errors="coerce").fillna(0.0).round(2)
                 show_df["Change %"] = pd.to_numeric(show_df["Change %"], errors="coerce").fillna(0.0).round(2)
-                st.dataframe(show_df, use_container_width=True, hide_index=True, height=360)
+                return show_df
 
             cc1, cc2 = st.columns(2)
             with cc1:
-                _show_constituents("Top Movers - Shariah 50", idx50.get("constituents", pd.DataFrame()), 25)
+                st.markdown("#### Shariah 50 Constituents (All)")
+                sh50_df = _format_constituents(idx50.get("constituents", pd.DataFrame()))
+                if sh50_df.empty:
+                    st.info("No Shariah 50 constituents available.")
+                else:
+                    st.dataframe(sh50_df, use_container_width=True, hide_index=True, height=420)
             with cc2:
-                _show_constituents("Top Movers - Shariah 100", idx100.get("constituents", pd.DataFrame()), 35)
+                st.markdown("#### Shariah 100 Constituents (All)")
+                sh100_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
+                if sh100_df.empty:
+                    st.info("No Shariah 100 constituents available.")
+                else:
+                    st.dataframe(sh100_df, use_container_width=True, hide_index=True, height=520)
+
+            st.markdown("#### Top Gainers and Top Losers (Shariah 100)")
+            movers_df = _format_constituents(idx100.get("constituents", pd.DataFrame()))
+            if movers_df.empty:
+                st.info("No mover data available.")
+            else:
+                gcol, lcol = st.columns(2)
+                with gcol:
+                    st.markdown("**Top Gainers**")
+                    top_gainers_df = movers_df.sort_values("Change %", ascending=False).head(20)
+                    st.dataframe(top_gainers_df, use_container_width=True, hide_index=True, height=360)
+                with lcol:
+                    st.markdown("**Top Losers**")
+                    top_losers_df = movers_df.sort_values("Change %", ascending=True).head(20)
+                    st.dataframe(top_losers_df, use_container_width=True, hide_index=True, height=360)
     except Exception as exc:
         st.error(f"Shariah index view unavailable: {exc}")
 

@@ -2908,6 +2908,90 @@ with tab_portfolio:
         st.markdown("---")
         
         # ── Section C: Trade Selection ───────────────────────────────────────
+        # AI-ranked candidates with checkmarks for manual paper-test execution
+        st.subheader("AI Top Performing Stocks")
+        st.caption("Select stocks to test via paper trading. AI levels are used for entry, SL, target, and sizing.")
+
+        ai_trade_pool = engines['selector'].select_trades(
+            opportunities=execution_candidates,
+            allocation=allocation,
+            market_sentiment=sentiment
+        )
+
+        if ai_trade_pool:
+            preview_rows = []
+            for t in ai_trade_pool:
+                preview_rows.append({
+                    "Select": False,
+                    "Symbol": str(t.get("symbol", "")).upper(),
+                    "Mode": str(t.get("mode", "")).upper(),
+                    "Entry": float(pd.to_numeric(t.get("entry", 0), errors="coerce") or 0.0),
+                    "Stop Loss": float(pd.to_numeric(t.get("stop_loss", 0), errors="coerce") or 0.0),
+                    "Target": float(pd.to_numeric(t.get("target", 0), errors="coerce") or 0.0),
+                    "Qty": int(pd.to_numeric(t.get("quantity", 0), errors="coerce") or 0),
+                    "Position Value": float(pd.to_numeric(t.get("position_value", 0), errors="coerce") or 0.0),
+                    "Win Prob %": float(pd.to_numeric(t.get("win_probability", 0), errors="coerce") or 0.0) * 100.0,
+                    "Expected %": float(pd.to_numeric(t.get("expected_return", 0), errors="coerce") or 0.0),
+                    "R:R": float(pd.to_numeric(t.get("rr_ratio", 0), errors="coerce") or 0.0),
+                })
+
+            ai_df = pd.DataFrame(preview_rows)
+            for col_name in ["Entry", "Stop Loss", "Target", "Position Value", "Win Prob %", "Expected %", "R:R"]:
+                ai_df[col_name] = pd.to_numeric(ai_df[col_name], errors="coerce").fillna(0.0).round(2)
+
+            edited_ai_df = st.data_editor(
+                ai_df,
+                hide_index=True,
+                use_container_width=True,
+                height=320,
+                column_config={
+                    "Select": st.column_config.CheckboxColumn("Select", default=False),
+                },
+                disabled=["Symbol", "Mode", "Entry", "Stop Loss", "Target", "Qty", "Position Value", "Win Prob %", "Expected %", "R:R"],
+                key="ai_select_trade_editor",
+            )
+
+            selected_symbols = set(
+                edited_ai_df.loc[edited_ai_df["Select"] == True, "Symbol"].astype(str).str.upper().tolist()
+            )
+            st.caption(f"Selected symbols: {len(selected_symbols)}")
+
+            if st.button("Execute Selected AI Paper Trades", type="primary", key="execute_selected_ai_trades_btn"):
+                if not selected_symbols:
+                    st.warning("Select at least one stock from the table.")
+                else:
+                    open_symbols = set()
+                    try:
+                        pos_summary = engines["trader"].get_position_summary()
+                        open_symbols = {str(p.get("symbol", "")).upper() for p in pos_summary.get("positions", [])}
+                    except Exception:
+                        open_symbols = set()
+
+                    executed = 0
+                    skipped_open = 0
+                    for trade in ai_trade_pool:
+                        sym = str(trade.get("symbol", "")).upper()
+                        if sym not in selected_symbols:
+                            continue
+                        if sym in open_symbols:
+                            skipped_open += 1
+                            continue
+                        trade_id = engines["trader"].enter_trade(trade)
+                        if trade_id > 0:
+                            executed += 1
+
+                    if executed > 0:
+                        msg = f"Executed {executed} AI paper trade(s)."
+                        if skipped_open:
+                            msg += f" Skipped {skipped_open} already-open symbol(s)."
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.warning("No trades executed. Check selection and open positions.")
+        else:
+            st.info("No AI candidates available for manual selection right now.")
+
+        st.markdown("---")
         st.subheader("🎯 Selected Trades")
         
         if st.button("🚀 Run Autonomous Trade Selection", type="primary"):
@@ -2977,6 +3061,109 @@ with tab_portfolio:
     st.markdown("---")
     
     # ── Section D: Live Positions ────────────────────────────────────────────
+    st.subheader("📊 Active Positions")
+    
+        # Manual paper-trade testing
+    st.subheader("Manual Paper Trade (Test)")
+    st.caption("Create a manual paper position for testing only. No real orders are sent.")
+
+    manual_stocks = get_active_stocks()
+    manual_symbols = sorted({str(s.get("symbol", "")).upper().strip() for s in manual_stocks if s.get("symbol")})
+    latest_metrics_rows = get_latest_metrics() or []
+    ltp_map = {}
+    for r in latest_metrics_rows:
+        try:
+            rr = dict(r) if not isinstance(r, dict) else r
+            sym = str(rr.get("symbol", "")).upper().strip()
+            ltp = float(pd.to_numeric(rr.get("ltp", np.nan), errors="coerce"))
+            if sym and np.isfinite(ltp):
+                ltp_map[sym] = ltp
+        except Exception:
+            continue
+
+    if not manual_symbols:
+        st.info("Load stocks first in Market Intelligence to enable manual paper trading.")
+    else:
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        with mc1:
+            manual_symbol = st.selectbox("Symbol", manual_symbols, index=0, key="manual_trade_symbol")
+        with mc2:
+            manual_mode = st.selectbox("Mode", ["intraday", "swing"], index=0, key="manual_trade_mode")
+        with mc3:
+            manual_strategy = st.text_input("Strategy Tag", value="manual_test", key="manual_trade_strategy")
+        with mc4:
+            entry_default = float(ltp_map.get(manual_symbol, 1.0))
+            manual_entry = st.number_input(
+                "Entry",
+                min_value=0.01,
+                value=max(0.01, entry_default),
+                step=0.05,
+                format="%.2f",
+                key="manual_trade_entry",
+            )
+
+        mc5, mc6, mc7, mc8 = st.columns(4)
+        with mc5:
+            manual_sl = st.number_input(
+                "Stop Loss",
+                min_value=0.01,
+                value=max(0.01, manual_entry * 0.98),
+                step=0.05,
+                format="%.2f",
+                key="manual_trade_sl",
+            )
+        with mc6:
+            manual_target = st.number_input(
+                "Target",
+                min_value=0.01,
+                value=max(0.01, manual_entry * 1.02),
+                step=0.05,
+                format="%.2f",
+                key="manual_trade_target",
+            )
+        with mc7:
+            manual_qty = st.number_input("Quantity", min_value=1, max_value=100000, value=1, step=1, key="manual_trade_qty")
+        with mc8:
+            risk_amt = max(0.0, (manual_entry - manual_sl) * manual_qty)
+            reward_amt = max(0.0, (manual_target - manual_entry) * manual_qty)
+            rr_ratio = (reward_amt / risk_amt) if risk_amt > 0 else 0.0
+            st.metric("R:R", f"{rr_ratio:.2f}")
+
+        if st.button("Place Manual Paper Trade", use_container_width=True, key="manual_paper_trade_btn"):
+            if manual_sl >= manual_entry:
+                st.error("Stop Loss must be below Entry for this manual long paper trade.")
+            elif manual_target <= manual_entry:
+                st.error("Target must be above Entry for this manual long paper trade.")
+            else:
+                trade_payload = {
+                    "symbol": manual_symbol,
+                    "entry": float(manual_entry),
+                    "stop_loss": float(manual_sl),
+                    "target": float(manual_target),
+                    "rr_ratio": float(rr_ratio if rr_ratio > 0 else 2.0),
+                    "quantity": int(manual_qty),
+                    "mode": manual_mode,
+                    "strategy": (manual_strategy or "manual_test").strip(),
+                    "total_risk": float(risk_amt),
+                    "potential_profit": float(reward_amt),
+                    "position_value": float(manual_entry * manual_qty),
+                    "win_probability": None,
+                    "expected_return": None,
+                    "entry_rsi": None,
+                    "entry_adx": None,
+                    "entry_trend_score": None,
+                    "market_regime": "manual",
+                }
+                new_trade_id = engines["trader"].enter_trade(trade_payload)
+                if new_trade_id > 0:
+                    st.success(f"Manual paper trade placed for {manual_symbol} (ID: {new_trade_id})")
+                    st.rerun()
+                else:
+                    st.error("Failed to place manual paper trade.")
+
+    st.markdown("---")
+    
+    # Live positions
     st.subheader("📊 Active Positions")
     
     position_summary = engines['trader'].get_position_summary()
@@ -3454,5 +3641,7 @@ with tab_ai:
 st.markdown("---")
 st.caption("🧠 Meezan Edge v3.0 — Autonomous Halal Hedge Fund System | Profit Maximization Mode")
 st.caption("⚠️ PAPER TRADING ONLY — No real capital deployment")
+
+
 
 

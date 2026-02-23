@@ -2912,13 +2912,34 @@ with tab_portfolio:
         st.subheader("AI Top Performing Stocks")
         st.caption("Select stocks to test via paper trading. AI levels are used for entry, SL, target, and sizing.")
 
+        ai_source_label = "strict execution filters"
+        ai_candidate_opportunities = execution_candidates
+        if not ai_candidate_opportunities and scored:
+            # Fallback: use top scored opportunities so table is always testable.
+            scored_df = pd.DataFrame(scored)
+            if not scored_df.empty:
+                scored_df["opportunity_score"] = pd.to_numeric(scored_df.get("opportunity_score", 0), errors="coerce").fillna(0.0)
+                scored_df["win_probability"] = pd.to_numeric(scored_df.get("win_probability", 0), errors="coerce").fillna(0.0)
+                scored_df["expected_return"] = pd.to_numeric(scored_df.get("expected_return", 0), errors="coerce").fillna(0.0)
+                fallback_df = scored_df[
+                    (scored_df["opportunity_score"] >= 55)
+                    & (scored_df["win_probability"] >= 0.50)
+                ].sort_values(
+                    by=["opportunity_score", "win_probability", "expected_return"],
+                    ascending=[False, False, False],
+                ).head(20)
+                ai_candidate_opportunities = fallback_df.to_dict("records")
+                if ai_candidate_opportunities:
+                    ai_source_label = "fallback top scored opportunities"
+
         ai_trade_pool = engines['selector'].select_trades(
-            opportunities=execution_candidates,
+            opportunities=ai_candidate_opportunities,
             allocation=allocation,
             market_sentiment=sentiment
         )
 
         if ai_trade_pool:
+            st.caption(f"Candidate source: {ai_source_label}")
             preview_rows = []
             for t in ai_trade_pool:
                 preview_rows.append({

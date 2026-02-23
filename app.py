@@ -943,6 +943,14 @@ with st.sidebar:
     st.markdown("#### Zerodha")
     try:
         sidebar_z_client = get_zerodha_client()
+        if st.button("🔁 Refresh Zerodha Auth", use_container_width=True, key="refresh_zerodha_auth_btn"):
+            _clear_persisted_zerodha_token()
+            st.session_state.pop("zerodha_access_token", None)
+            st.session_state.pop("zerodha_last_request_token", None)
+            st.session_state.pop("startup_ltp_sync_status", None)
+            st.session_state.pop("startup_ltp_sync_date", None)
+            st.info("Zerodha auth reset. Please connect again.")
+            st.rerun()
         if sidebar_z_client.is_authenticated:
             st.success("Connected")
             st.caption(_get_zerodha_reauth_remaining())
